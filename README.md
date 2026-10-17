@@ -1,44 +1,74 @@
 # Random Treasure Drop
 
-A D2RLoader server plugin that chooses one configured Treasure Class selector for each numbered group when a game starts. Ordinary selectors match one exact row; `actboss` and `superunique` are shorthand pools of rows associated with those monster categories, from which the plugin selects one row per group. D2R runs its normal drop routine unchanged. Separately, each selected group makes one weighted bonus-drop roll whenever its selected row is evaluated and, on success, creates one additional item at the source unit's ground coordinates. The plugin does not modify compiled Treasure Class rows or use the row's `Picks` value to repeat bonus rolls.
+Random Treasure Drop is a D2RLoader plugin that creates independently rolled bonus items from configured Treasure Class rows. The game's normal drop routine runs unchanged; a successful plugin roll creates one additional item at the source unit's location when available.
 
-> **0.1.32.** Game-join logs report that a droptable was selected without printing its name or row. Successful bonus drops continue to be logged.
+## Install
+
+1. Download `d2rl-random-treasure-drop.dll` and `random-treasure-drop.toml` from the [latest release](https://github.com/MadMike616/random-treasure-drop/releases/latest).
+2. Place the DLL in D2RLoader's `plugins` folder and the TOML file in its `config` folder.
+3. Edit the TOML with item codes and Treasure Class row names available in the game's data files.
+
+The included TOML has one blank example group. It is ignored until configured. Copy its three settings and increment the number to add more groups.
 
 ## Configuration
 
-The config file is `random-treasure-drop.toml` in the plugin's D2RLoader config folder.
-
-The shipped config contains one blank group. Fill in its empty item code and Treasure Class row name; copy the group and increment the numeric suffix to add more. The untouched blank group is ignored.
+Each numbered group has an item, an optional weight, and a non-empty list of Treasure Class rows or special selectors:
 
 ```toml
-item1 = "www"
-weight1 = 10
-droptables_item1 = ["aaa", "bbb", "ccc"]
+item1 = "abc"
+weight1 = 100
+droptables_item1 = ["Example Treasure Class"]
 
-item2 = "type:xxx"
-weight2 = 5
-droptables_item2 = ["ddd", "eee", "fff"]
+item2 = "type:swor"
+weight2 = 10
+droptables_item2 = ["actboss:normal", "Example Treasure Class"]
 ```
 
-- `itemN` accepts a three- or four-character item code, or `type:xxx` for an item-type code. A type chooses a spawnable base item from that type or one of its equivalent child types.
-- `weightN` is the extra item's relative drop weight in its selected row. It defaults to `1`; valid values are `1` through `1000000`.
-- `droptables_itemN` is a list of exact row names from `treasureclassex.txt` or special selectors. One list entry is chosen uniformly at game join; an ordinary name resolves to one row, while a special selector is a pool from which one matching row is chosen uniformly.
-- `actboss` matches the standard five act bosses in all difficulties. Add `:normal`, `:nightmare`, or `:hell` to limit it to one difficulty, for example `"actboss:normal"`. Rows whose names contain `Desecrated` are excluded.
-- `superunique` matches the Treasure Class rows referenced by `superuniques.txt` across all difficulties. Add `:normal`, `:nightmare`, or `:hell` to restrict the rows to one difficulty, for example `"superunique:hell"`. Rows whose names contain `Desecrated` are excluded.
-- `desecrated` matches every row in `treasureclassex.txt` whose Treasure Class name contains `Desecrated`. Add `:normal`, `:nightmare`, or `:hell` to choose one difficulty. Difficulty is identified by row-name markers: unmarked rows are Normal, `(N)` rows are Nightmare, and `(H)` rows are Hell.
-- Add more numbered groups as needed. Every `itemN` must have a matching `droptables_itemN`.
+Replace the example item codes and row name with values available in the game's data. Every `itemN` needs a matching `droptables_itemN`.
 
-At `GameJoined`, each group selects one selector uniformly from its list. If it is a special selector, the plugin then selects one matching source row uniformly from that selector's pool; an ordinary row name resolves directly to its single row. The selection is cleared at `GameLeft`. Game data can share a Treasure Class row between monster types, so a selected row may also match another unit that uses that row.
+- `itemN`: a spawnable three- or four-character item code, such as `"abc"`, or an item type prefixed with `type:`, such as `"type:swor"`. A type can match items in equivalent child types; the plugin chooses a matching base item using its `rarity` value.
+- `weightN`: the extra item's weight in the bonus-drop calculation. It defaults to `1` and must be from `1` through `1000000`.
+- `droptables_itemN`: a list of exact Treasure Class row names or special selectors. Row names are matched without regard to letter case. The plugin first chooses one list entry uniformly. If that entry is a special selector, it then chooses one matching row uniformly from that selector's pool.
+
+The special selectors are:
+
+| Selector | Rows included |
+| --- | --- |
+| `actboss` | Treasure Class rows referenced by the five act bosses. Rows containing `Desecrated` are excluded. |
+| `superunique` | Treasure Class rows referenced by `superuniques.txt`. Rows containing `Desecrated` are excluded. |
+| `desecrated` | Rows whose Treasure Class name contains `Desecrated`. |
+
+Every special selector accepts `:normal`, `:nightmare`, or `:hell` to limit its pool to one difficulty. A selector without a difficulty suffix includes all difficulties. For example:
+
+```toml
+droptables_item1 = ["actboss:normal", "Act 1 Chest A"]
+```
+
+This gives each of the two list entries an equal chance of selection. If `actboss:normal` is selected, one row is then selected from the Normal act-boss pool.
 
 ## Drop behavior
 
-Each numbered group gets one independent bonus roll whenever its single selected row is evaluated, regardless of `Picks`. For each group, the success chance is `weightN / (source-row weight total + weightN)`. If several groups selected the same row, each gets its own roll and each may create an additional item. The native game drop and each bonus roll are separate calculations; a bonus success never replaces a native drop. The source TXT row's static `NoDrop` and `Prob1` through `Prob10` values set the baseline. D2R's runtime `/players` NoDrop adjustment is not included.
+When a character enters a game, the plugin selects one row for each configured item group. It clears those selections when the character leaves the game. Each time a selected row is evaluated, its group gets one independent bonus-drop roll; the row's `Picks` value does not repeat that roll. Groups that select the same row roll independently.
 
-After the game's original drop routine finishes, each successful bonus roll resolves its packed item code to the compiled Items table's row index (the native class ID), then calls `ITEMS_CreateItemUnit` and `D2GAME_ReturnItemToGround` synchronously from the drop hook. It uses the source unit's dynamic-path coordinates only when both are positive and within range; otherwise, it uses the responsible player's location and room. It skips the bonus when no player or valid location exists. It does not modify the compiled Treasure Class table or the game's native drop result.
+The bonus chance for a group is:
 
-The created item has Normal quality and uses the level passed to the native drop routine, clamped to 1–99. Item-type codes choose a base item using the `rarity` weight from the active mod's `weapons.txt`, `armor.txt`, and `misc.txt` data. The active mod's plain-text Excel files must be accessible to the plugin.
+```text
+weightN / (NoDrop + Prob1 + Prob2 + ... + Prob10 + weightN)
+```
 
-## Building
+The plugin runs this calculation separately from the game's native drop calculation. A successful roll adds one item and never replaces or changes a native drop. For an item type, the plugin chooses among matching spawnable base items using their `rarity` weights.
+
+The baseline uses the source row's static `NoDrop` and `Prob1` through `Prob10` values. D2R's runtime `/players` adjustment to `NoDrop` is not included in the bonus-drop calculation.
+
+The bonus item is created at the source unit's ground location when its location data is valid. If that location cannot be read, the plugin tries the responsible player's location. The item uses Normal quality and the level supplied to the native drop routine, clamped to 1–99.
+
+Logs report that a group selected a droptable and whether a bonus item was created. They do not identify the selected row.
+
+## Compatibility
+
+The native drop hook and supporting game functions are validated for D2R build `3.3.93847`. The plugin requires D2RLoader PluginSDK ABI 4, including its lifecycle and data-table services. It checks the expected game-code signatures and Treasure Class table layout, and leaves the hook uninstalled if validation fails.
+
+## Build
 
 Build on Windows with CMake 3.29 or newer and the Visual Studio C++ and Windows SDK components:
 
@@ -47,12 +77,9 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-CMake fetches the pinned D2RLoader PluginSDK revision. To build offline, set `RANDOM_TREASURE_DROP_LOCAL_SDK_DIR` to a local PluginSDK checkout when configuring.
+The build fetches a pinned D2RLoader PluginSDK revision. To build offline, configure with `RANDOM_TREASURE_DROP_LOCAL_SDK_DIR` set to a local PluginSDK checkout.
 
-## Compatibility
+## License
 
-The native hook, path and room accessors, complete item-creation body (302 bytes), and complete ground-placement body (271 bytes) are gated to D2R build `3.3.93847` and require their captured byte signatures to match. Treasure Classes row size `0x150` is checked, and the plugin accepts a larger compiled runtime table only when it finds exactly one contiguous row range whose `Picks` values align with the configured source table. `Picks` is used only to align runtime rows, not to control the bonus roll. The game and loader must provide D2RLoader PluginSDK ABI 4 lifecycle and data-table services, including item lookup by code.
+This project is distributed under the MIT License. See [LICENSE](LICENSE).
 
-Runtime drop behavior was confirmed in GrailerRL with D2R `3.3.93847` and D2RLoader `1.3.1-beta` using PluginSDK ABI 4. Version 0.1.32's logging-only change was build-verified but was not separately play-tested.
-
-Versions 0.1.8 through 0.1.10 triggered D2Common room assertions and a D2RLoader access violation while placing items through SDK automatic placement. Versions 0.1.11 through 0.1.19 were read-only diagnostics. Version 0.1.20 also crashed after SDK exact ground placement. Version 0.1.21 completed a chest drop without crashing, but its native creator received the packed item code instead of the required class ID and did not produce the bonus item. Version 0.1.22 resolved the class ID; its first reported crash followed a successful native helper call at `(4199, 0)`. Version 0.1.23 used the player's position when either source coordinate was zero and was later confirmed in-game to drop bonus items by monster corpses, including multiple kills. A 0.1.24 diagnostic that forced the coordinates to `(0,0)` logged a successful native placement and then crashed D2RLoader. Version 0.1.25 restores the 0.1.23 coordinate fallback and adds validated category selectors; version 0.1.26 adds difficulty-qualified superunique selectors and the plural alias; version 0.1.27 removes that alias; version 0.1.28 makes special selectors choose one row from their candidate pools; version 0.1.29 adds `desecrated` and excludes those rows from the actboss and superunique pools; version 0.1.30 adds desecrated difficulty filters; version 0.1.31 synchronizes the shipped default TOML with the current template; version 0.1.32 removes selected row names from game-join logs.
