@@ -41,7 +41,7 @@ The special selectors are:
 Every special selector accepts `:normal`, `:nightmare`, or `:hell` to limit its pool to one difficulty. A selector without a difficulty suffix includes all difficulties. For example:
 
 ```toml
-droptables_item1 = ["actboss:normal", "Act 1 Chest A"]
+droptables_item1 = ["actboss:normal", "Example Treasure Class"]
 ```
 
 This gives each of the two list entries an equal chance of selection. If `actboss:normal` is selected, one row is then selected from the Normal act-boss pool.
