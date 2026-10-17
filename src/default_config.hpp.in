@@ -1,0 +1,3 @@
+#pragma once
+
+inline constexpr char DefaultConfig[] = R"D2RLDROP(@RANDOM_TREASURE_DROP_DEFAULT_CONFIG@)D2RLDROP";

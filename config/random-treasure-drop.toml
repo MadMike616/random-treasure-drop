@@ -1,0 +1,26 @@
+# Random Treasure Drop configuration
+#
+# Each numbered group has three settings:
+#   itemN               Three- or four-character item code, or "type:xxx" for an item type
+#   weightN             Relative extra-item drop weight; this is the only weight setting. The maximum allowed value is 1000000.
+#   droptables_itemN    Treasure Class row names or special selectors
+#
+# When a game starts, the plugin chooses one entry uniformly from each list. And it clears the selected entry on Save/Exit.
+# Special selectors are shorthand pools of matching rows. One row from the pool
+# is randomly selected for each numbered group when a game starts.
+#
+# Special selectors (each accepts a difficulty suffix):
+#   actboss[:normal|nightmare|hell]
+#   superunique[:normal|nightmare|hell]
+#   desecrated[:normal|nightmare|hell]
+# Bare selectors cover all difficulties.
+# Examples:
+# droptables_itemN = ["actboss:normal"]                     # Selects one row from the pool of rows that has to do with act bosses in normal
+# droptables_itemN = ["actboss:normal", "Act 1 Chest A"]    # Selects one row from the pool of rows that has to do with act bosses in normal OR "Act 1 Chest A"
+#
+# To add more entries, copy the three settings below and increment the number
+# consistently. The blank placeholder is ignored until you fill it in.
+
+item1 = ""
+weight1 = 1
+droptables_item1 = [""]
