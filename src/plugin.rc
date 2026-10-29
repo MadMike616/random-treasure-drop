@@ -4,8 +4,8 @@
 D2RL_PLUGIN_MANIFEST_RESOURCE_ID RCDATA { D2RL_PLUGIN_RESOURCE_DWORD(D2RL_PLUGIN_API_VERSION) }
 
 1 VERSIONINFO
-FILEVERSION 0,1,32,0
-PRODUCTVERSION 0,1,32,0
+FILEVERSION 0,1,40,0
+PRODUCTVERSION 0,1,40,0
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
@@ -13,11 +13,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "MadMike"
       VALUE "FileDescription", "Independent weighted Treasure Class bonus drops."
-      VALUE "FileVersion", "0.1.32"
+      VALUE "FileVersion", "0.1.40"
       VALUE "InternalName", "random-treasure-drop"
       VALUE "OriginalFilename", "d2rl-random-treasure-drop.dll"
       VALUE "ProductName", "Random Treasure Drop"
-      VALUE "ProductVersion", "0.1.32"
+      VALUE "ProductVersion", "0.1.40"
     END
   END
   BLOCK "VarFileInfo"
@@ -25,3 +25,4 @@ BEGIN
     VALUE "Translation", 0x0409, 1200
   END
 END
+

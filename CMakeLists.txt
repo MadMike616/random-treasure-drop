@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.29)
 
-project(RandomTreasureDrop VERSION 0.1.32 LANGUAGES CXX RC)
+project(RandomTreasureDrop VERSION 0.1.40 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,3 +52,4 @@ if(MSVC)
     target_compile_options(random_treasure_drop PRIVATE /W4 /permissive- /EHsc /utf-8)
     target_link_options(random_treasure_drop PRIVATE /INCREMENTAL:NO /Brepro)
 endif()
+

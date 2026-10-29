@@ -49,8 +49,11 @@ constexpr std::uint32_t TreasureClassItemListCapacityOffset = 0x48;
 constexpr std::uint32_t TreasureClassItemEntryDiagnosticSize = 32;
 constexpr std::uint32_t TreasureClassMaxItems = 10;
 constexpr std::uint32_t MaximumNativeProbeCalls = 32;
+constexpr std::uint64_t DuplicateDropSuppressionWindowMs = 250;
+constexpr std::size_t RecentDropEventCapacity = 128;
 constexpr bool EnableBonusDrops = true;
 constexpr bool EnableProbeLogging = false;
+constexpr bool EnableDropOutcomeDiagnostics = true;
 constexpr std::array<std::uint8_t, 16> HookExpectedBytes{
     0x4C, 0x8B, 0xDC, 0x55, 0x53, 0x49, 0x8D, 0xAB,
     0x08, 0xF7, 0xFF, 0xFF, 0x48, 0x81, 0xEC, 0xE8,
@@ -115,10 +118,21 @@ using ReturnItemToGroundFn = void(__fastcall*)(
     std::int32_t x,
     std::int32_t y);
 
+enum class ItemQuality : std::int32_t {
+    Low = 1,
+    Normal = 2,
+    Superior = 3,
+    Magic = 4,
+    Set = 5,
+    Rare = 6,
+    Unique = 7,
+};
+
 struct ItemCandidate {
     std::uint32_t packedCode{};
     std::uint32_t classId{std::numeric_limits<std::uint32_t>::max()};
     std::uint32_t rarityWeight{1};
+    ItemQuality quality{ItemQuality::Normal};
 };
 
 struct DropTableSelector {
@@ -126,12 +140,22 @@ struct DropTableSelector {
     std::vector<std::uint32_t> sourceRowIndices;
 };
 
+struct ItemOption {
+    ItemQuality quality{ItemQuality::Normal};
+    std::vector<ItemCandidate> candidates;
+};
+
+struct ItemSpec {
+    std::string itemCode;
+    ItemQuality quality{ItemQuality::Normal};
+};
+
 struct Rule {
     std::uint32_t number{};
-    std::string itemSpec;
+    std::vector<ItemSpec> itemSpecs;
     std::uint32_t itemWeight{1};
     std::vector<DropTableSelector> dropTableSelectors;
-    std::vector<ItemCandidate> candidates;
+    std::vector<ItemOption> itemOptions;
 };
 
 struct TreasureClassInfo {
@@ -161,9 +185,20 @@ struct BonusDrop {
     std::uint32_t itemCode{};
     std::uint32_t itemClassId{};
     std::uint32_t itemLevel{};
+    ItemQuality quality{ItemQuality::Normal};
     std::uint32_t x{};
     std::uint32_t y{};
     void* room{};
+};
+
+struct RecentDropEvent {
+    void* game{};
+    void* sourceUnit{};
+    void* room{};
+    std::uint32_t rowIndex{};
+    std::uint32_t x{};
+    std::uint32_t y{};
+    std::uint64_t tick{};
 };
 
 enum class NativeDropResult : std::uint8_t {
@@ -190,7 +225,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = PluginId,
     .name = "Random Treasure Drop",
-    .version = "0.1.32",
+    .version = "0.1.40",
     .author = "MadMike",
     .description = "Adds independently rolled bonus drops at selected Treasure Class sources.",
     .flags = D2RL::PluginFlags::Server | D2RL::PluginFlags::NativeHooks,
@@ -222,6 +257,13 @@ std::atomic<bool> GameActive{};
 std::atomic<std::uint32_t> RuntimeTableRowCount{};
 std::atomic<std::uint32_t> RuntimeSourceRowOffset{};
 std::atomic<std::uint64_t> RuntimeTableRevision{};
+std::atomic<std::uint32_t> ObservedDropHookCount{};
+std::atomic<std::uint32_t> MappedDropHookCount{};
+std::atomic<std::uint32_t> MatchedDropCallbackCount{};
+std::atomic<std::uint32_t> SuppressedDuplicateDropCount{};
+std::array<RecentDropEvent, RecentDropEventCapacity> RecentDropEvents{};
+std::size_t RecentDropEventNext{};
+std::size_t RecentDropEventCount{};
 
 std::atomic<bool> NativeDropProbeLogged{};
 std::atomic<std::uint32_t> NativeDropProbeCallCount{};
@@ -425,6 +467,41 @@ auto ValidCode(std::string_view code) noexcept -> bool {
     return true;
 }
 
+auto ParseItemSpec(std::string_view text, ItemSpec& item,
+        std::string& error) -> bool {
+    const std::string value = Trim(text);
+    const auto comma = value.find(',');
+    item.itemCode = Trim(std::string_view(value).substr(0, comma));
+    item.quality = ItemQuality::Normal;
+    if (comma == std::string::npos) return true;
+    if (value.find(',', comma + 1) != std::string::npos) {
+        error = "item entries may contain only one comma between the item code and quality";
+        return false;
+    }
+
+    const std::string quality = Lower(Trim(
+        std::string_view(value).substr(comma + 1)));
+    if (quality == "lowquality" || quality == "inferior") {
+        item.quality = ItemQuality::Low;
+    } else if (quality == "normal") {
+        item.quality = ItemQuality::Normal;
+    } else if (quality == "superior") {
+        item.quality = ItemQuality::Superior;
+    } else if (quality == "magic") {
+        item.quality = ItemQuality::Magic;
+    } else if (quality == "set") {
+        item.quality = ItemQuality::Set;
+    } else if (quality == "rare") {
+        item.quality = ItemQuality::Rare;
+    } else if (quality == "unique") {
+        item.quality = ItemQuality::Unique;
+    } else {
+        error = "item quality must be lowquality, normal, superior, magic, set, rare, or unique";
+        return false;
+    }
+    return true;
+}
+
 auto ParseConfig(std::string_view text, std::vector<Rule>& parsed,
         std::string& error) -> bool {
     try {
@@ -452,9 +529,19 @@ auto ParseConfig(std::string_view text, std::vector<Rule>& parsed,
             std::vector<std::string> parsedArray;
             std::int64_t parsedInteger{};
             if (ParseNumberedKey(key, "item", number)) {
-                if (!ParseQuotedString(value, parsedString)) {
-                    error = key + " must be a quoted string";
-                    return false;
+                const std::string trimmedValue = Trim(value);
+                if (!trimmedValue.empty() && trimmedValue.front() == '[') {
+                    if (!ParseStringArray(value, parsedArray)
+                            || parsedArray.empty()) {
+                        error = key + " must be a non-empty array of quoted item codes or type selectors";
+                        return false;
+                    }
+                } else {
+                    if (!ParseQuotedString(value, parsedString)) {
+                        error = key + " must be a quoted item code or a non-empty array of quoted item codes or type selectors";
+                        return false;
+                    }
+                    parsedArray.push_back(std::move(parsedString));
                 }
                 auto& group = groups[number];
                 if (group.hasItem) {
@@ -463,14 +550,30 @@ auto ParseConfig(std::string_view text, std::vector<Rule>& parsed,
                 }
                 group.hasItem = true;
                 group.rule.number = number;
-                group.rule.itemSpec = Trim(parsedString);
+                for (auto& spec : parsedArray) {
+                    ItemSpec item;
+                    if (!ParseItemSpec(spec, item, error)) {
+                        error = key + " " + error;
+                        return false;
+                    }
+                    group.rule.itemSpecs.push_back(std::move(item));
+                }
                 continue;
             }
             if (ParseNumberedKey(key, "droptables_item", number)) {
-                if (!ParseStringArray(value, parsedArray)
-                        || parsedArray.empty()) {
-                    error = key + " must be a non-empty array of quoted Treasure Class names or special selectors";
-                    return false;
+                const std::string trimmedValue = Trim(value);
+                if (!trimmedValue.empty() && trimmedValue.front() == '[') {
+                    if (!ParseStringArray(value, parsedArray)
+                            || parsedArray.empty()) {
+                        error = key + " must be a quoted Treasure Class name or special selector, or a non-empty array of them";
+                        return false;
+                    }
+                } else {
+                    if (!ParseQuotedString(value, parsedString)) {
+                        error = key + " must be a quoted Treasure Class name or special selector, or a non-empty array of them";
+                        return false;
+                    }
+                    parsedArray.push_back(std::move(parsedString));
                 }
                 auto& group = groups[number];
                 if (group.hasRows) {
@@ -522,26 +625,26 @@ auto ParseConfig(std::string_view text, std::vector<Rule>& parsed,
                     + " and droptables_item" + std::to_string(number);
                 return false;
             }
-            if (group.rule.dropTableSelectors.size() == 1
-                    && group.rule.dropTableSelectors.front().spec.empty()) {
-                if (!group.rule.itemSpec.empty()) {
-                    std::string_view itemCode = group.rule.itemSpec;
-                    if (itemCode.starts_with("type:")) itemCode.remove_prefix(5);
-                    if (!ValidCode(itemCode)) {
-                        error = "item" + std::to_string(number)
-                            + " must be a 3- or 4-character code, optionally prefixed with type:";
-                        return false;
-                    }
-                }
-                continue;
-            }
-            std::string_view itemCode = group.rule.itemSpec;
-            if (itemCode.starts_with("type:")) itemCode.remove_prefix(5);
-            if (!ValidCode(itemCode)) {
+            const bool blankRows = group.rule.dropTableSelectors.size() == 1
+                && group.rule.dropTableSelectors.front().spec.empty();
+            const bool blankItems = group.rule.itemSpecs.size() == 1
+                && group.rule.itemSpecs.front().itemCode.empty();
+            if (blankRows && blankItems) continue;
+            if (group.rule.itemSpecs.empty()) {
                 error = "item" + std::to_string(number)
-                    + " must be a 3- or 4-character code, optionally prefixed with type:";
+                    + " must contain at least one item code or type selector";
                 return false;
             }
+            for (const auto& itemSpec : group.rule.itemSpecs) {
+                std::string_view itemCode = itemSpec.itemCode;
+                if (itemCode.starts_with("type:")) itemCode.remove_prefix(5);
+                if (!ValidCode(itemCode)) {
+                    error = "item" + std::to_string(number)
+                        + " entries must be 3- or 4-character codes, optionally prefixed with type:";
+                    return false;
+                }
+            }
+            if (blankRows) continue;
             std::unordered_set<std::string> selectorSpecs;
             for (const auto& selector : group.rule.dropTableSelectors) {
                 if (!selectorSpecs.insert(Lower(selector.spec)).second) {
@@ -948,6 +1051,7 @@ auto ResolveDropTableSelectors(std::vector<Rule>& rules,
     bool needsActBoss{};
     bool needsSuperUnique{};
     bool needsDesecrated{};
+    bool needsAny{};
     for (const auto& rule : rules) {
         for (const auto& selector : rule.dropTableSelectors) {
             const auto spec = Lower(selector.spec);
@@ -985,6 +1089,20 @@ auto ResolveDropTableSelectors(std::vector<Rule>& rules,
                     return false;
                 }
                 needsDesecrated = true;
+            } else if (spec == "any") {
+                needsAny = true;
+            } else if (spec.starts_with("any:")) {
+                const auto colon = spec.find(':');
+                const auto difficulty =
+                    std::string_view(spec).substr(colon + 1);
+                if (difficulty != "normal" && difficulty != "nightmare"
+                        && difficulty != "hell") {
+                    error = "unsupported any difficulty in selector '"
+                        + selector.spec
+                        + "'; use normal, nightmare, or hell";
+                    return false;
+                }
+                needsAny = true;
             }
         }
     }
@@ -1071,6 +1189,43 @@ auto ResolveDropTableSelectors(std::vector<Rule>& rules,
                 std::vector<std::uint32_t>(rows.begin(), rows.end()));
         }
     }
+    if (needsAny) {
+        constexpr std::array<std::string_view, 3> Difficulties{
+            "normal", "nightmare", "hell",
+        };
+        std::set<std::uint32_t> allRows;
+        std::array<std::set<std::uint32_t>, Difficulties.size()>
+            rowsByDifficulty;
+        for (std::size_t index = 0; index < treasureClasses.size(); ++index) {
+            const auto name = Lower(treasureClasses[index].name);
+            const auto rowIndex = static_cast<std::uint32_t>(index);
+            allRows.insert(rowIndex);
+            const bool isNightmare = name.find("(n)") != std::string::npos;
+            const bool isHell = name.find("(h)") != std::string::npos;
+            const std::size_t difficultyIndex = isHell ? 2
+                : (isNightmare ? 1 : 0);
+            rowsByDifficulty[difficultyIndex].insert(rowIndex);
+        }
+        if (allRows.empty()) {
+            error = "the any selector did not find any Treasure Class rows";
+            return false;
+        }
+        specialRows.emplace("any",
+            std::vector<std::uint32_t>(allRows.begin(), allRows.end()));
+        for (std::size_t difficultyIndex = 0;
+                difficultyIndex < Difficulties.size(); ++difficultyIndex) {
+            const auto& rows = rowsByDifficulty[difficultyIndex];
+            if (rows.empty()) {
+                error = "the any:" + std::string(
+                    Difficulties[difficultyIndex])
+                    + " selector did not find any matching Treasure Class rows";
+                return false;
+            }
+            specialRows.emplace("any:"
+                    + std::string(Difficulties[difficultyIndex]),
+                std::vector<std::uint32_t>(rows.begin(), rows.end()));
+        }
+    }
 
     for (auto& rule : rules) {
         for (auto& selector : rule.dropTableSelectors) {
@@ -1103,7 +1258,6 @@ struct SourceItem {
     std::string type1;
     std::string type2;
     std::uint32_t rarity{};
-    bool spawnable{};
 };
 
 auto ReadItemSources(const std::vector<std::filesystem::path>& roots,
@@ -1142,7 +1296,6 @@ auto ReadItemSources(const std::vector<std::filesystem::path>& roots,
         const auto codeColumn = ColumnIndex(table, "code");
         const auto type1Column = ColumnIndex(table, "type");
         const auto type2Column = ColumnIndex(table, "type2");
-        const auto spawnableColumn = ColumnIndex(table, "spawnable");
         const auto rarityColumn = ColumnIndex(table, "rarity");
         if (codeColumn == std::numeric_limits<std::size_t>::max()) {
             error = std::string(file) + " is missing its code column";
@@ -1151,19 +1304,16 @@ auto ReadItemSources(const std::vector<std::filesystem::path>& roots,
         for (const auto& row : table.rows) {
             const auto code = Lower(Cell(row, codeColumn));
             if (!ValidCode(code) || !seen.insert(code).second) continue;
-            const auto spawnable = ParseSignedCell(
-                Cell(row, spawnableColumn), 1);
-            if (spawnable == 0) continue;
             const auto rarityValue = ParseSignedCell(Cell(row, rarityColumn), 1);
             const auto rarity = rarityValue > 0
                 ? static_cast<std::uint32_t>(std::min<std::int64_t>(rarityValue, 1000000))
                 : 1U;
             items.push_back({code, Lower(Cell(row, type1Column)),
-                Lower(Cell(row, type2Column)), rarity, true});
+                Lower(Cell(row, type2Column)), rarity});
         }
     }
     if (items.empty()) {
-        error = "no spawnable item rows were found in the active mod files";
+        error = "no valid item rows were found in the active mod files";
         return false;
     }
     return true;
@@ -1177,55 +1327,65 @@ auto ResolveRuleItems(std::vector<Rule>& rules,
     itemsByCode.reserve(items.size());
     for (const auto& item : items) itemsByCode.emplace(item.code, &item);
     for (auto& rule : rules) {
-        const bool isType = rule.itemSpec.starts_with("type:");
-        const std::string code = Lower(isType
-            ? std::string_view(rule.itemSpec).substr(5)
-            : std::string_view(rule.itemSpec));
-        if (!isType) {
-            const auto found = itemsByCode.find(code);
-            if (found == itemsByCode.end()) {
-                error = "item" + std::to_string(rule.number)
-                    + " code '" + code + "' is not a spawnable code in the active mod";
-                return false;
+        rule.itemOptions.clear();
+        rule.itemOptions.reserve(rule.itemSpecs.size());
+        for (const auto& itemSpec : rule.itemSpecs) {
+            ItemOption option;
+            option.quality = itemSpec.quality;
+            const bool isType = itemSpec.itemCode.starts_with("type:");
+            const std::string code = Lower(isType
+                ? std::string_view(itemSpec.itemCode).substr(5)
+                : std::string_view(itemSpec.itemCode));
+            if (!isType) {
+                const auto found = itemsByCode.find(code);
+                if (found == itemsByCode.end()) {
+                    error = "item" + std::to_string(rule.number)
+                        + " code '" + code + "' was not found in the active mod item files";
+                    return false;
+                }
+                option.candidates.push_back({
+                    D2RL::Items::MakeItemCode(code[0], code[1],
+                        code.size() > 2 ? code[2] : ' ',
+                        code.size() > 3 ? code[3] : ' '),
+                    std::numeric_limits<std::uint32_t>::max(),
+                    found->second->rarity});
+                rule.itemOptions.push_back(std::move(option));
+                continue;
             }
-            rule.candidates.push_back({
-                D2RL::Items::MakeItemCode(code[0], code[1],
-                    code.size() > 2 ? code[2] : ' ',
-                    code.size() > 3 ? code[3] : ' '),
-                std::numeric_limits<std::uint32_t>::max(),
-                found->second->rarity});
-            continue;
-        }
 
-        std::unordered_set<std::string> acceptedTypes{code};
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            for (const auto& type : types) {
-                if (acceptedTypes.contains(type.code)) continue;
-                if ((!type.parent1.empty() && acceptedTypes.contains(type.parent1))
-                        || (!type.parent2.empty()
-                            && acceptedTypes.contains(type.parent2))) {
-                    acceptedTypes.insert(type.code);
-                    changed = true;
+            std::unordered_set<std::string> acceptedTypes{code};
+            bool changed = true;
+            while (changed) {
+                changed = false;
+                for (const auto& type : types) {
+                    if (acceptedTypes.contains(type.code)) continue;
+                    if ((!type.parent1.empty()
+                            && acceptedTypes.contains(type.parent1))
+                            || (!type.parent2.empty()
+                                && acceptedTypes.contains(type.parent2))) {
+                        acceptedTypes.insert(type.code);
+                        changed = true;
+                    }
                 }
             }
-        }
-        for (const auto& item : items) {
-            if (acceptedTypes.contains(item.type1)
-                    || acceptedTypes.contains(item.type2)) {
-                rule.candidates.push_back({
-                    D2RL::Items::MakeItemCode(item.code[0], item.code[1],
-                        item.code.size() > 2 ? item.code[2] : ' ',
-                        item.code.size() > 3 ? item.code[3] : ' '),
-                    std::numeric_limits<std::uint32_t>::max(),
-                    item.rarity});
+            for (const auto& item : items) {
+                if (acceptedTypes.contains(item.type1)
+                        || acceptedTypes.contains(item.type2)) {
+                    option.candidates.push_back({
+                        D2RL::Items::MakeItemCode(item.code[0], item.code[1],
+                            item.code.size() > 2 ? item.code[2] : ' ',
+                            item.code.size() > 3 ? item.code[3] : ' '),
+                        std::numeric_limits<std::uint32_t>::max(),
+                        item.rarity});
+                }
             }
-        }
-        if (rule.candidates.empty()) {
-            error = "item" + std::to_string(rule.number)
-                + " type '" + code + "' did not match any spawnable base items";
-            return false;
+            if (option.candidates.empty()) {
+                error = "item" + std::to_string(rule.number)
+                    + " type '" + code
+                    + "' did not match any base items in the active mod";
+                return false;
+            }
+            rule.itemOptions.push_back(std::move(option));
         }
     }
     return true;
@@ -1238,18 +1398,27 @@ auto RandomBelow(std::uint64_t upperExclusive) -> std::uint64_t {
 }
 
 auto SelectItemCandidate(const Rule& rule) -> ItemCandidate {
+    if (rule.itemOptions.empty()) return {};
+    const auto selectedOption = static_cast<std::size_t>(
+        RandomBelow(rule.itemOptions.size()));
+    const auto& option = rule.itemOptions[selectedOption];
+    const auto& candidates = option.candidates;
     std::uint64_t total{};
-    for (const auto& candidate : rule.candidates) {
+    for (const auto& candidate : candidates) {
         total += candidate.rarityWeight;
     }
-    if (rule.candidates.empty()) return {};
-    if (total == 0) return rule.candidates.front();
+    if (candidates.empty()) return {};
+    auto withQuality = [&](ItemCandidate candidate) {
+        candidate.quality = option.quality;
+        return candidate;
+    };
+    if (total == 0) return withQuality(candidates.front());
     auto selection = RandomBelow(total);
-    for (const auto& candidate : rule.candidates) {
-        if (selection < candidate.rarityWeight) return candidate;
+    for (const auto& candidate : candidates) {
+        if (selection < candidate.rarityWeight) return withQuality(candidate);
         selection -= candidate.rarityWeight;
     }
-    return rule.candidates.back();
+    return withQuality(candidates.back());
 }
 
 auto HasSupportedBuild(const D2RL::PluginContext* context) noexcept -> bool {
@@ -1437,8 +1606,40 @@ __declspec(noinline) auto TryGetDropLocation(void* unit,
     }
 }
 
+auto IsRepeatedDropEvent(void* game, void* sourceUnit,
+        std::uint32_t rowIndex, void* room,
+        std::uint32_t x, std::uint32_t y) noexcept -> bool {
+    const auto now = static_cast<std::uint64_t>(GetTickCount64());
+    const std::lock_guard<std::mutex> lock(StateMutex);
+    for (std::size_t offset = 0; offset < RecentDropEventCount; ++offset) {
+        const auto index = (RecentDropEventNext + RecentDropEventCapacity
+            - 1U - offset) % RecentDropEventCapacity;
+        const auto& recent = RecentDropEvents[index];
+        if (now < recent.tick
+                || now - recent.tick > DuplicateDropSuppressionWindowMs) {
+            continue;
+        }
+        if (recent.game != game || recent.rowIndex != rowIndex) continue;
+        const bool sameSource = sourceUnit != nullptr
+            && recent.sourceUnit == sourceUnit;
+        const bool samePosition = room != nullptr && recent.room == room
+            && recent.x == x && recent.y == y;
+        if (sameSource || samePosition) return true;
+    }
+
+    RecentDropEvents[RecentDropEventNext] = {
+        game, sourceUnit, room, rowIndex, x, y, now,
+    };
+    RecentDropEventNext = (RecentDropEventNext + 1U)
+        % RecentDropEventCapacity;
+    RecentDropEventCount = std::min(RecentDropEventCount + 1U,
+        RecentDropEventCapacity);
+    return false;
+}
+
 __declspec(noinline) auto CreateAndPlaceBonusDrop(void* game, void* player,
-        std::uint32_t itemClassId, std::uint32_t itemLevel, void* room,
+        std::uint32_t itemClassId, std::uint32_t itemLevel,
+        ItemQuality itemQuality, void* room,
         std::uint32_t x, std::uint32_t y) noexcept -> NativeDropResult {
     if (game == nullptr || player == nullptr || room == nullptr
             || CreateItemUnit == nullptr || ReturnItemToGround == nullptr
@@ -1454,7 +1655,8 @@ __declspec(noinline) auto CreateAndPlaceBonusDrop(void* game, void* player,
     void* item{};
     __try {
         item = CreateItemUnit(player, itemClassId, game,
-            4, 2, 1, 1, static_cast<std::int32_t>(itemLevel), 0, 0, 0);
+            4, static_cast<std::int32_t>(itemQuality), 1, 1,
+            static_cast<std::int32_t>(itemLevel), 0, 0, 0);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return NativeDropResult::ItemCreationException;
     }
@@ -1646,9 +1848,14 @@ void __fastcall DropTreasureClassHook(
         std::int32_t quality,
         std::int32_t level,
         std::int32_t arg7,
-    void** items,
-    std::int32_t* itemsDropped,
-    std::int32_t maxItems) {
+        void** items,
+        std::int32_t* itemsDropped,
+        std::int32_t maxItems) {
+    if constexpr (EnableDropOutcomeDiagnostics) {
+        if (GameActive.load(std::memory_order_acquire)) {
+            ObservedDropHookCount.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
     std::uint32_t probeOrdinal = std::numeric_limits<std::uint32_t>::max();
     if (EnableProbeLogging && Context != nullptr
             && GameActive.load(std::memory_order_acquire)) {
@@ -1690,6 +1897,9 @@ void __fastcall DropTreasureClassHook(
             return;
         }
         const auto rowIndex = GetTableRowIndex(treasureClass, tableView);
+        if (rowIndex != std::numeric_limits<std::uint32_t>::max()) {
+            MappedDropHookCount.fetch_add(1, std::memory_order_acq_rel);
+        }
         if (probeOrdinal < MaximumNativeProbeCalls) {
             const auto sourceOffset = RuntimeSourceRowOffset.load(
                 std::memory_order_acquire);
@@ -1723,19 +1933,30 @@ void __fastcall DropTreasureClassHook(
         if (rowIndex < sourceOffset) return;
         const auto sourceIndex = static_cast<std::size_t>(rowIndex - sourceOffset);
         if (sourceIndex >= TreasureClasses.size()) return;
-        bool matchesSelectedRow{};
+        std::uint32_t matchingGroupCount{};
         {
             const std::lock_guard<std::mutex> lock(StateMutex);
             for (const auto& [selectedRowIndex, ruleIndex] : ActiveRules) {
                 if (selectedRowIndex == rowIndex && ruleIndex < Rules.size()) {
-                    matchesSelectedRow = true;
-                    break;
+                    ++matchingGroupCount;
                 }
             }
         }
-        if (!matchesSelectedRow) return;
+        if (matchingGroupCount == 0) return;
+        const auto matchedCallback = MatchedDropCallbackCount.fetch_add(
+            1, std::memory_order_acq_rel) + 1;
         if (!EnableBonusDrops) return;
-        if (game == nullptr || player == nullptr) return;
+        if (game == nullptr || player == nullptr) {
+            if constexpr (EnableDropOutcomeDiagnostics) {
+                char summary[192]{};
+                (void)std::snprintf(summary, sizeof(summary),
+                    "RandomTreasureDrop trace: matched callback=%u groups=%u; drop context unavailable.",
+                    static_cast<unsigned>(matchedCallback),
+                    static_cast<unsigned>(matchingGroupCount));
+                Context->LogInfo(summary);
+            }
+            return;
+        }
 
         const std::uint32_t itemLevel = static_cast<std::uint32_t>(
             std::clamp(level, 1, 99));
@@ -1744,9 +1965,45 @@ void __fastcall DropTreasureClassHook(
         void* dropRoom{};
         if (!TryGetDropLocation(monster, dropX, dropY, dropRoom)
                 && !TryGetDropLocation(player, dropX, dropY, dropRoom)) {
+            if constexpr (EnableDropOutcomeDiagnostics) {
+                char summary[192]{};
+                (void)std::snprintf(summary, sizeof(summary),
+                    "RandomTreasureDrop trace: matched callback=%u groups=%u; no usable drop location.",
+                    static_cast<unsigned>(matchedCallback),
+                    static_cast<unsigned>(matchingGroupCount));
+                Context->LogInfo(summary);
+            }
             return;
         }
+        if (IsRepeatedDropEvent(game, monster, rowIndex, dropRoom,
+                dropX, dropY)) {
+            const auto suppressedCount =
+                SuppressedDuplicateDropCount.fetch_add(
+                    1, std::memory_order_acq_rel) + 1;
+            if constexpr (EnableDropOutcomeDiagnostics) {
+                char summary[192]{};
+                (void)std::snprintf(summary, sizeof(summary),
+                    "RandomTreasureDrop trace: callback=%u repeat suppressed at (%u,%u); suppressed=%u.",
+                    static_cast<unsigned>(matchedCallback),
+                    static_cast<unsigned>(dropX),
+                    static_cast<unsigned>(dropY),
+                    static_cast<unsigned>(suppressedCount));
+                Context->LogInfo(summary);
+            }
+            return;
+        }
+        if constexpr (EnableDropOutcomeDiagnostics) {
+            char summary[192]{};
+            (void)std::snprintf(summary, sizeof(summary),
+                "RandomTreasureDrop trace: matched callback=%u groups=%u at (%u,%u).",
+                static_cast<unsigned>(matchedCallback),
+                static_cast<unsigned>(matchingGroupCount),
+                static_cast<unsigned>(dropX),
+                static_cast<unsigned>(dropY));
+            Context->LogInfo(summary);
+        }
         std::vector<BonusDrop> earnedDrops;
+        std::vector<std::string> diagnosticMessages;
         {
             const std::lock_guard<std::mutex> lock(StateMutex);
             for (const auto& [selectedRow, ruleIndex] : ActiveRules) {
@@ -1760,29 +2017,52 @@ void __fastcall DropTreasureClassHook(
                     continue;
                 }
                 const auto totalWeight = nativeWeight + itemWeight;
-                if (totalWeight == 0
-                        || RandomBelow(totalWeight) < nativeWeight) {
+                if (totalWeight == 0) {
                     continue;
                 }
+                const bool rollPassed = RandomBelow(totalWeight) >= nativeWeight;
+                if constexpr (EnableDropOutcomeDiagnostics) {
+                    char summary[192]{};
+                    (void)std::snprintf(summary, sizeof(summary),
+                        "RandomTreasureDrop trace: callback=%u item%u roll=%s.",
+                        static_cast<unsigned>(matchedCallback),
+                        static_cast<unsigned>(Rules[ruleIndex].number),
+                        rollPassed ? "passed" : "missed");
+                    diagnosticMessages.emplace_back(summary);
+                }
+                if (!rollPassed) continue;
                 const auto candidate = SelectItemCandidate(Rules[ruleIndex]);
                 if (candidate.packedCode == 0
                         || candidate.classId
                             == std::numeric_limits<std::uint32_t>::max()) {
+                    if constexpr (EnableDropOutcomeDiagnostics) {
+                        char summary[192]{};
+                        (void)std::snprintf(summary, sizeof(summary),
+                            "RandomTreasureDrop trace: callback=%u item%u passed its roll but had no resolved item candidate.",
+                            static_cast<unsigned>(matchedCallback),
+                            static_cast<unsigned>(Rules[ruleIndex].number));
+                        diagnosticMessages.emplace_back(summary);
+                    }
                     continue;
                 }
                 earnedDrops.push_back({
                     candidate.packedCode,
                     candidate.classId,
                     itemLevel,
+                    candidate.quality,
                     dropX,
                     dropY,
                     dropRoom,
                 });
             }
         }
+        for (const auto& message : diagnosticMessages) {
+            Context->LogInfo(message.c_str());
+        }
         for (const auto& drop : earnedDrops) {
             const auto nativeResult = CreateAndPlaceBonusDrop(game, player,
-                drop.itemClassId, drop.itemLevel, drop.room, drop.x, drop.y);
+                drop.itemClassId, drop.itemLevel, drop.quality,
+                drop.room, drop.x, drop.y);
             if (nativeResult != NativeDropResult::Success) {
                 char message[192]{};
                 (void)std::snprintf(message, sizeof(message),
@@ -1833,42 +2113,44 @@ auto ResolveNativeItemClassIds(std::uint64_t revision) noexcept -> bool {
     std::size_t resolved{};
     std::lock_guard<std::mutex> lock(StateMutex);
     for (auto& rule : Rules) {
-        for (auto& candidate : rule.candidates) {
-            D2RL::DataTables::RowView row{
-                .structSize = D2RL::DataTables::RowViewSize,
-            };
-            if (DataTableService->findRowByCode(Context,
-                    D2RL::DataTables::Bank::Rotw,
-                    D2RL::DataTables::TableId::Items,
-                    candidate.packedCode, &row)
-                        != D2RL::DataTables::Result::Success
-                    || !D2RL::DataTables::HasRowViewField(&row,
-                        D2RL::DataTables::RowViewRequiredSize)
-                    || row.tableId != D2RL::DataTables::TableId::Items
-                    || row.bank != D2RL::DataTables::Bank::Rotw
-                    || row.revision != revision
-                    || row.row == nullptr
-                    || row.rowSize != itemsTable.rowSize
-                    || row.rowIndex >= itemsTable.rowCount) {
-                char message[192]{};
-                (void)std::snprintf(message, sizeof(message),
-                    "RandomTreasureDrop: could not resolve item code 0x%08X to a native class ID; bonus drops are disabled.",
-                    static_cast<unsigned>(candidate.packedCode));
-                Context->LogError(message);
-                return false;
+        for (auto& option : rule.itemOptions) {
+            for (auto& candidate : option.candidates) {
+                D2RL::DataTables::RowView row{
+                    .structSize = D2RL::DataTables::RowViewSize,
+                };
+                if (DataTableService->findRowByCode(Context,
+                        D2RL::DataTables::Bank::Rotw,
+                        D2RL::DataTables::TableId::Items,
+                        candidate.packedCode, &row)
+                            != D2RL::DataTables::Result::Success
+                        || !D2RL::DataTables::HasRowViewField(&row,
+                            D2RL::DataTables::RowViewRequiredSize)
+                        || row.tableId != D2RL::DataTables::TableId::Items
+                        || row.bank != D2RL::DataTables::Bank::Rotw
+                        || row.revision != revision
+                        || row.row == nullptr
+                        || row.rowSize != itemsTable.rowSize
+                        || row.rowIndex >= itemsTable.rowCount) {
+                    char message[192]{};
+                    (void)std::snprintf(message, sizeof(message),
+                        "RandomTreasureDrop: could not resolve item code 0x%08X to a native class ID; bonus drops are disabled.",
+                        static_cast<unsigned>(candidate.packedCode));
+                    Context->LogError(message);
+                    return false;
+                }
+                const auto expectedAddress = itemsBase
+                    + static_cast<std::uintptr_t>(row.rowIndex)
+                        * itemsTable.rowSize;
+                if (expectedAddress < itemsBase
+                        || reinterpret_cast<std::uintptr_t>(row.row)
+                            != expectedAddress) {
+                    Context->LogError(
+                        "RandomTreasureDrop: item code lookup returned an inconsistent Items row; bonus drops are disabled.");
+                    return false;
+                }
+                candidate.classId = row.rowIndex;
+                ++resolved;
             }
-            const auto expectedAddress = itemsBase
-                + static_cast<std::uintptr_t>(row.rowIndex)
-                    * itemsTable.rowSize;
-            if (expectedAddress < itemsBase
-                    || reinterpret_cast<std::uintptr_t>(row.row)
-                        != expectedAddress) {
-                Context->LogError(
-                    "RandomTreasureDrop: item code lookup returned an inconsistent Items row; bonus drops are disabled.");
-                return false;
-            }
-            candidate.classId = row.rowIndex;
-            ++resolved;
         }
     }
     if (resolved == 0) return Rules.empty();
@@ -1888,6 +2170,10 @@ void __cdecl OnDataTablesLoaded(
     GameActive.store(false, std::memory_order_release);
     NativeDropProbeLogged.store(false, std::memory_order_release);
     NativeDropProbeCallCount.store(0, std::memory_order_release);
+    ObservedDropHookCount.store(0, std::memory_order_release);
+    MappedDropHookCount.store(0, std::memory_order_release);
+    MatchedDropCallbackCount.store(0, std::memory_order_release);
+    SuppressedDuplicateDropCount.store(0, std::memory_order_release);
     RuntimeTableRowCount.store(0, std::memory_order_release);
     RuntimeSourceRowOffset.store(0, std::memory_order_release);
     RuntimeTableRevision.store(0, std::memory_order_release);
@@ -1980,6 +2266,9 @@ void __cdecl OnDataTablesLoaded(
             const std::lock_guard<std::mutex> lock(StateMutex);
             TreasureClassByHash = std::move(hashes);
             ActiveRules.clear();
+            RecentDropEvents.fill(RecentDropEvent{});
+            RecentDropEventNext = 0;
+            RecentDropEventCount = 0;
         }
         RuntimeTableRowCount.store(view.rowCount, std::memory_order_release);
         RuntimeSourceRowOffset.store(
@@ -2037,11 +2326,18 @@ void __cdecl OnGameJoined(
     GameActive.store(false, std::memory_order_release);
     NativeDropProbeLogged.store(false, std::memory_order_release);
     NativeDropProbeCallCount.store(0, std::memory_order_release);
+    ObservedDropHookCount.store(0, std::memory_order_release);
+    MappedDropHookCount.store(0, std::memory_order_release);
+    MatchedDropCallbackCount.store(0, std::memory_order_release);
+    SuppressedDuplicateDropCount.store(0, std::memory_order_release);
     try {
     std::vector<std::string> selectionMessages;
     {
         const std::lock_guard<std::mutex> lock(StateMutex);
         ActiveRules.clear();
+        RecentDropEvents.fill(RecentDropEvent{});
+        RecentDropEventNext = 0;
+        RecentDropEventCount = 0;
         if (!TableReady.load(std::memory_order_acquire)) {
             Context->LogError(
                 "RandomTreasureDrop: game joined before Treasure Classes were validated; custom drops are disabled for this session.");
@@ -2132,11 +2428,32 @@ void __cdecl OnGameLeft(
                 ? "yes" : "no");
         Context->LogInfo(summary);
     }
+    if constexpr (EnableDropOutcomeDiagnostics) {
+        char summary[192]{};
+        (void)std::snprintf(summary, sizeof(summary),
+            "RandomTreasureDrop trace: game ended; callbacks=%u mapped=%u selected-matches=%u repeats-suppressed=%u.",
+            static_cast<unsigned>(ObservedDropHookCount.load(
+                std::memory_order_acquire)),
+            static_cast<unsigned>(MappedDropHookCount.load(
+                std::memory_order_acquire)),
+            static_cast<unsigned>(MatchedDropCallbackCount.load(
+                std::memory_order_acquire)),
+            static_cast<unsigned>(SuppressedDuplicateDropCount.load(
+                std::memory_order_acquire)));
+        Context->LogInfo(summary);
+    }
     GameActive.store(false, std::memory_order_release);
     NativeDropProbeLogged.store(false, std::memory_order_release);
+    ObservedDropHookCount.store(0, std::memory_order_release);
+    MappedDropHookCount.store(0, std::memory_order_release);
+    MatchedDropCallbackCount.store(0, std::memory_order_release);
+    SuppressedDuplicateDropCount.store(0, std::memory_order_release);
     {
         const std::lock_guard<std::mutex> lock(StateMutex);
         ActiveRules.clear();
+        RecentDropEvents.fill(RecentDropEvent{});
+        RecentDropEventNext = 0;
+        RecentDropEventCount = 0;
     }
 }
 
@@ -2211,6 +2528,9 @@ void Shutdown() noexcept {
     {
         const std::lock_guard<std::mutex> lock(StateMutex);
         ActiveRules.clear();
+        RecentDropEvents.fill(RecentDropEvent{});
+        RecentDropEventNext = 0;
+        RecentDropEventCount = 0;
         Rules.clear();
         TreasureClasses.clear();
         TreasureClassByName.clear();
@@ -2328,7 +2648,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(
         return false;
     }
     Context->LogInfo(
-        "RandomTreasureDrop 0.1.32: selected droptables are not named in the log; successful bonus drops are logged. Zero path coordinates still fall back to the player's location.");
+        "RandomTreasureDrop 0.1.40 diagnostic build: repeated same-source callbacks within 250 ms are suppressed; callback matches and bonus-roll outcomes are logged without naming rows. Zero path coordinates still fall back to the player's location.");
     return true;
 }
 
@@ -2336,3 +2656,4 @@ D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     Shutdown();
     Context = nullptr;
 }
+

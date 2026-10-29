@@ -1,11 +1,20 @@
 # Random Treasure Drop configuration
 #
 # Each numbered group has three settings:
-#   itemN               Three- or four-character item code, or "type:xxx" for an item type
+#   itemN               One item code/type string or an array of choices. Each array entry has an equal chance when a bonus drop succeeds.
 #   weightN             Relative extra-item drop weight; this is the only weight setting. The maximum allowed value is 1000000.
-#   droptables_itemN    Treasure Class row names or special selectors
+#   droptables_itemN    One Treasure Class row/special selector, or an array of them
+# Numbered groups must use N from 1 through 10000 (maximum 10000 groups).
 #
-# When a game starts, the plugin chooses one entry uniformly from each list. And it clears the selected entry on Save/Exit.
+# Item codes are three or four characters. Prefix a type code with "type:", such as "type:swor".
+# Item lookup does not filter on the spawnable column; the code must still exist in an active item table.
+# Add an optional quality after a comma inside the string, such as "type:armo, unique".
+# Supported qualities: lowquality (or inferior), normal, superior, magic, set, rare, unique.
+# Without a quality suffix, the item is normal quality.
+# If a type entry is chosen, the plugin selects a matching base item using its rarity value.
+# A single itemN may also use the legacy string form; arrays are needed for multiple choices.
+# When a game starts, the plugin chooses one droptable entry for each numbered group. It clears those selections on Save/Exit.
+# For an item array, it chooses one item uniformly each time that group's bonus drop succeeds.
 # Special selectors are shorthand pools of matching rows. One row from the pool
 # is randomly selected for each numbered group when a game starts.
 #
@@ -13,14 +22,19 @@
 #   actboss[:normal|nightmare|hell]
 #   superunique[:normal|nightmare|hell]
 #   desecrated[:normal|nightmare|hell]
+#   any[:normal|nightmare|hell]
+# `any` includes every Treasure Class row; its difficulty suffix filters rows
+# by name: no (N)/(H) suffix is Normal, (N) is Nightmare, and (H) is Hell.
 # Bare selectors cover all difficulties.
 # Examples:
-# droptables_itemN = ["actboss:normal"]                     # Selects one row from the pool of rows that has to do with act bosses in normal
-# droptables_itemN = ["actboss:normal", "Act 1 Chest A"]    # Selects one row from the pool of rows that has to do with act bosses in normal OR "Act 1 Chest A"
+# droptables_itemN = "desecrated:normal"                       # Selects one row from the pool of rows that has to do with desecrated zones in normal
+# droptables_itemN = ["desecrated:normal"]                     # Same as above
+# droptables_itemN = ["actboss:normal", "Act 1 Chest A"]       # First selects "actboss:normal" or "Act 1 Chest A" 50/50, then if "actboss:normal" was selected it selects a row in that pool.
 #
 # To add more entries, copy the three settings below and increment the number
 # consistently. The blank placeholder is ignored until you fill it in.
 
-item1 = ""
+item1 = [""]
 weight1 = 1
 droptables_item1 = [""]
+
