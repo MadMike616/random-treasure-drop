@@ -69,7 +69,7 @@ The baseline uses the source row's static `NoDrop` and `Prob1` through `Prob10` 
 
 The bonus item is created at the source unit's ground location when its location data is valid. If that location cannot be read, the plugin tries the responsible player's location. Its quality defaults to Normal unless the selected item entry specifies another quality, and its level comes from the native drop routine, clamped to 1–99.
 
-Logs report group selections, bonus-roll outcomes, and created drops. They do not identify the selected row.
+Logs confirm group selections and successful bonus drops. They never identify the selected Treasure Class row.
 
 ## Compatibility
 
@@ -89,4 +89,3 @@ The build fetches a pinned D2RLoader PluginSDK revision. To build offline, confi
 ## License
 
 This project is distributed under the MIT License. See [LICENSE](LICENSE).
-

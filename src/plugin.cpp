@@ -46,14 +46,10 @@ constexpr std::uint32_t TreasureClassPicksOffset = 0x18;
 constexpr std::uint32_t TreasureClassItemListOffset = 0x38;
 constexpr std::uint32_t TreasureClassItemListCountOffset = 0x40;
 constexpr std::uint32_t TreasureClassItemListCapacityOffset = 0x48;
-constexpr std::uint32_t TreasureClassItemEntryDiagnosticSize = 32;
 constexpr std::uint32_t TreasureClassMaxItems = 10;
-constexpr std::uint32_t MaximumNativeProbeCalls = 32;
 constexpr std::uint64_t DuplicateDropSuppressionWindowMs = 250;
 constexpr std::size_t RecentDropEventCapacity = 128;
 constexpr bool EnableBonusDrops = true;
-constexpr bool EnableProbeLogging = false;
-constexpr bool EnableDropOutcomeDiagnostics = true;
 constexpr std::array<std::uint8_t, 16> HookExpectedBytes{
     0x4C, 0x8B, 0xDC, 0x55, 0x53, 0x49, 0x8D, 0xAB,
     0x08, 0xF7, 0xFF, 0xFF, 0x48, 0x81, 0xEC, 0xE8,
@@ -225,7 +221,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = PluginId,
     .name = "Random Treasure Drop",
-    .version = "0.1.40",
+    .version = "0.1.41",
     .author = "MadMike",
     .description = "Adds independently rolled bonus drops at selected Treasure Class sources.",
     .flags = D2RL::PluginFlags::Server | D2RL::PluginFlags::NativeHooks,
@@ -257,16 +253,9 @@ std::atomic<bool> GameActive{};
 std::atomic<std::uint32_t> RuntimeTableRowCount{};
 std::atomic<std::uint32_t> RuntimeSourceRowOffset{};
 std::atomic<std::uint64_t> RuntimeTableRevision{};
-std::atomic<std::uint32_t> ObservedDropHookCount{};
-std::atomic<std::uint32_t> MappedDropHookCount{};
-std::atomic<std::uint32_t> MatchedDropCallbackCount{};
-std::atomic<std::uint32_t> SuppressedDuplicateDropCount{};
 std::array<RecentDropEvent, RecentDropEventCapacity> RecentDropEvents{};
 std::size_t RecentDropEventNext{};
 std::size_t RecentDropEventCount{};
-
-std::atomic<bool> NativeDropProbeLogged{};
-std::atomic<std::uint32_t> NativeDropProbeCallCount{};
 
 auto Trim(std::string_view value) -> std::string {
     std::size_t first{};
@@ -1674,137 +1663,6 @@ __declspec(noinline) auto CreateAndPlaceBonusDrop(void* game, void* player,
     return NativeDropResult::Success;
 }
 
-void LogNativeDropProbe(
-        const void* validatedRow,
-        void* game,
-        void* monster,
-        void* player,
-        std::int32_t quality,
-        std::int32_t level,
-        std::int32_t arg7,
-        void** items,
-        std::int32_t* itemsDropped,
-        std::int32_t maxItems,
-        std::int32_t picks) noexcept {
-    if (Context == nullptr) return;
-    std::int32_t droppedCount = -1;
-    const bool hasDroppedCount = itemsDropped != nullptr
-        && ReadMemory(itemsDropped, &droppedCount, sizeof(droppedCount));
-    char summary[512]{};
-    (void)std::snprintf(summary, sizeof(summary),
-        "RandomTreasureDrop probe: picks=%d quality=%d level=%d arg7=%d dropped=%d maxItems=%d game=%p monster=%p player=%p items=%p.",
-        picks, quality, level, arg7,
-        hasDroppedCount ? droppedCount : -1, maxItems,
-        game, monster, player, static_cast<void*>(items));
-    Context->LogInfo(summary);
-
-    std::array<std::uint8_t, CompiledTreasureClassRowSize> rowBytes{};
-    if (validatedRow == nullptr
-            || !ReadMemory(validatedRow, rowBytes.data(), rowBytes.size())) {
-        Context->LogWarn(
-            "RandomTreasureDrop probe: could not safely copy the validated runtime row.");
-        return;
-    }
-    constexpr std::size_t bytesPerLine = 48;
-    for (std::size_t offset = 0; offset < rowBytes.size(); offset += bytesPerLine) {
-        char message[192]{};
-        const auto lineBytes = std::min(bytesPerLine, rowBytes.size() - offset);
-        int length = std::snprintf(message, sizeof(message),
-            "RandomTreasureDrop probe: row-bytes offset=0x%03X data=",
-            static_cast<unsigned>(offset));
-        for (std::size_t index = 0; index < lineBytes
-                && length > 0
-                && static_cast<std::size_t>(length) < sizeof(message); ++index) {
-            length += std::snprintf(message + length,
-                sizeof(message) - static_cast<std::size_t>(length), "%02X",
-                static_cast<unsigned>(rowBytes[offset + index]));
-        }
-        Context->LogInfo(message);
-    }
-
-    std::uint64_t itemListAddress{};
-    std::uint64_t tcEntryCount{};
-    std::uint64_t itemCapacity{};
-    const auto* row = static_cast<const std::uint8_t*>(validatedRow);
-    if (!ReadMemory(row + TreasureClassItemListOffset,
-                &itemListAddress, sizeof(itemListAddress))
-            || !ReadMemory(row + TreasureClassItemListCountOffset,
-                &tcEntryCount, sizeof(tcEntryCount))
-            || !ReadMemory(row + TreasureClassItemListCapacityOffset,
-                &itemCapacity, sizeof(itemCapacity))) {
-        Context->LogWarn(
-            "RandomTreasureDrop probe: could not safely read the runtime item-list header.");
-    } else {
-        char message[224]{};
-        (void)std::snprintf(message, sizeof(message),
-            "RandomTreasureDrop probe: item-list address=%p size=%llu capacity=%llu.",
-            reinterpret_cast<void*>(static_cast<std::uintptr_t>(itemListAddress)),
-            static_cast<unsigned long long>(tcEntryCount),
-            static_cast<unsigned long long>(itemCapacity));
-        Context->LogInfo(message);
-        if (tcEntryCount > TreasureClassMaxItems
-                || itemCapacity > TreasureClassMaxItems
-                || tcEntryCount > itemCapacity
-                || (tcEntryCount != 0 && itemListAddress == 0)) {
-            Context->LogWarn(
-                "RandomTreasureDrop probe: runtime item-list dimensions were outside the expected TXT bounds.");
-        } else if (tcEntryCount == 0) {
-            Context->LogInfo(
-                "RandomTreasureDrop probe: dynamic item list is empty.");
-        } else {
-            std::array<std::uint8_t,
-                TreasureClassMaxItems
-                    * TreasureClassItemEntryDiagnosticSize> entries{};
-            const auto bytesToRead = static_cast<std::size_t>(tcEntryCount)
-                * TreasureClassItemEntryDiagnosticSize;
-            if (!ReadMemory(reinterpret_cast<const void*>(
-                        static_cast<std::uintptr_t>(itemListAddress)),
-                    entries.data(), bytesToRead)) {
-                Context->LogWarn(
-                    "RandomTreasureDrop probe: could not copy candidate 32-byte runtime item-list entries.");
-            } else {
-                for (std::size_t index = 0; index < tcEntryCount; ++index) {
-                    char entryMessage[224]{};
-                    const auto* entry = entries.data()
-                        + index * TreasureClassItemEntryDiagnosticSize;
-                    int length = std::snprintf(entryMessage,
-                        sizeof(entryMessage),
-                        "RandomTreasureDrop probe: item-list[%zu] candidate32=", index);
-                    for (std::size_t byte = 0;
-                            byte < TreasureClassItemEntryDiagnosticSize
-                                && length > 0
-                                && static_cast<std::size_t>(length)
-                                    < sizeof(entryMessage);
-                            ++byte) {
-                        length += std::snprintf(entryMessage + length,
-                            sizeof(entryMessage)
-                                - static_cast<std::size_t>(length), "%02X",
-                            static_cast<unsigned>(entry[byte]));
-                    }
-                    Context->LogInfo(entryMessage);
-                }
-            }
-        }
-    }
-
-    if (!hasDroppedCount || items == nullptr || maxItems <= 0
-            || droppedCount < 0 || droppedCount > maxItems) {
-        return;
-    }
-    const auto itemCount = std::min<std::int32_t>(droppedCount, 16);
-    for (std::int32_t index = 0; index < itemCount; ++index) {
-        void* nativeItem{};
-        const auto* itemSlot = reinterpret_cast<const std::uint8_t*>(items)
-            + static_cast<std::size_t>(index) * sizeof(nativeItem);
-        if (!ReadMemory(itemSlot, &nativeItem, sizeof(nativeItem))) break;
-        char message[160]{};
-        (void)std::snprintf(message, sizeof(message),
-            "RandomTreasureDrop probe: native-output[%d]=%p.", index,
-            nativeItem);
-        Context->LogInfo(message);
-    }
-}
-
 auto GetTableRowIndex(const void* row,
         const D2RL::DataTables::TableView& view) noexcept -> std::uint32_t {
     if (row == nullptr || view.rows == nullptr
@@ -1851,26 +1709,6 @@ void __fastcall DropTreasureClassHook(
         void** items,
         std::int32_t* itemsDropped,
         std::int32_t maxItems) {
-    if constexpr (EnableDropOutcomeDiagnostics) {
-        if (GameActive.load(std::memory_order_acquire)) {
-            ObservedDropHookCount.fetch_add(1, std::memory_order_acq_rel);
-        }
-    }
-    std::uint32_t probeOrdinal = std::numeric_limits<std::uint32_t>::max();
-    if (EnableProbeLogging && Context != nullptr
-            && GameActive.load(std::memory_order_acquire)) {
-        probeOrdinal = NativeDropProbeCallCount.fetch_add(
-            1, std::memory_order_acq_rel);
-        if (probeOrdinal < MaximumNativeProbeCalls) {
-            char summary[384]{};
-            (void)std::snprintf(summary, sizeof(summary),
-                "RandomTreasureDrop probe: hook-entry[%u] quality=%d level=%d arg7=%d items=%p droppedCount=%p maxItems=%d.",
-                static_cast<unsigned>(probeOrdinal),
-                quality, level, arg7, static_cast<void*>(items),
-                static_cast<void*>(itemsDropped), maxItems);
-            Context->LogInfo(summary);
-        }
-    }
     if (OriginalDropTreasureClass != nullptr) {
         OriginalDropTreasureClass(game, monster, player, treasureClass,
             quality, level, arg7, items, itemsDropped, maxItems);
@@ -1897,66 +1735,25 @@ void __fastcall DropTreasureClassHook(
             return;
         }
         const auto rowIndex = GetTableRowIndex(treasureClass, tableView);
-        if (rowIndex != std::numeric_limits<std::uint32_t>::max()) {
-            MappedDropHookCount.fetch_add(1, std::memory_order_acq_rel);
-        }
-        if (probeOrdinal < MaximumNativeProbeCalls) {
-            const auto sourceOffset = RuntimeSourceRowOffset.load(
-                std::memory_order_acquire);
-            const bool rowIndexValid = rowIndex
-                != std::numeric_limits<std::uint32_t>::max();
-            const bool sourceIndexValid = rowIndexValid
-                && rowIndex >= sourceOffset
-                && static_cast<std::size_t>(rowIndex - sourceOffset)
-                    < TreasureClasses.size();
-            bool matchesSelectedRow{};
-            if (sourceIndexValid) {
-                const std::lock_guard<std::mutex> lock(StateMutex);
-                for (const auto& [selectedRowIndex, ruleIndex] : ActiveRules) {
-                    if (selectedRowIndex == rowIndex
-                            && ruleIndex < Rules.size()) {
-                        matchesSelectedRow = true;
-                        break;
-                    }
-                }
-            }
-            char summary[384]{};
-            (void)std::snprintf(summary, sizeof(summary),
-                "RandomTreasureDrop probe: hook-map[%u] selected-table-match=%s.",
-                static_cast<unsigned>(probeOrdinal),
-                matchesSelectedRow ? "yes" : "no");
-            Context->LogInfo(summary);
-        }
         if (rowIndex == std::numeric_limits<std::uint32_t>::max()) return;
         const auto sourceOffset = RuntimeSourceRowOffset.load(
             std::memory_order_acquire);
         if (rowIndex < sourceOffset) return;
         const auto sourceIndex = static_cast<std::size_t>(rowIndex - sourceOffset);
         if (sourceIndex >= TreasureClasses.size()) return;
-        std::uint32_t matchingGroupCount{};
+        bool matchesSelectedRow{};
         {
             const std::lock_guard<std::mutex> lock(StateMutex);
             for (const auto& [selectedRowIndex, ruleIndex] : ActiveRules) {
                 if (selectedRowIndex == rowIndex && ruleIndex < Rules.size()) {
-                    ++matchingGroupCount;
+                    matchesSelectedRow = true;
+                    break;
                 }
             }
         }
-        if (matchingGroupCount == 0) return;
-        const auto matchedCallback = MatchedDropCallbackCount.fetch_add(
-            1, std::memory_order_acq_rel) + 1;
+        if (!matchesSelectedRow) return;
         if (!EnableBonusDrops) return;
-        if (game == nullptr || player == nullptr) {
-            if constexpr (EnableDropOutcomeDiagnostics) {
-                char summary[192]{};
-                (void)std::snprintf(summary, sizeof(summary),
-                    "RandomTreasureDrop trace: matched callback=%u groups=%u; drop context unavailable.",
-                    static_cast<unsigned>(matchedCallback),
-                    static_cast<unsigned>(matchingGroupCount));
-                Context->LogInfo(summary);
-            }
-            return;
-        }
+        if (game == nullptr || player == nullptr) return;
 
         const std::uint32_t itemLevel = static_cast<std::uint32_t>(
             std::clamp(level, 1, 99));
@@ -1964,46 +1761,10 @@ void __fastcall DropTreasureClassHook(
         std::uint32_t dropY{};
         void* dropRoom{};
         if (!TryGetDropLocation(monster, dropX, dropY, dropRoom)
-                && !TryGetDropLocation(player, dropX, dropY, dropRoom)) {
-            if constexpr (EnableDropOutcomeDiagnostics) {
-                char summary[192]{};
-                (void)std::snprintf(summary, sizeof(summary),
-                    "RandomTreasureDrop trace: matched callback=%u groups=%u; no usable drop location.",
-                    static_cast<unsigned>(matchedCallback),
-                    static_cast<unsigned>(matchingGroupCount));
-                Context->LogInfo(summary);
-            }
-            return;
-        }
+                && !TryGetDropLocation(player, dropX, dropY, dropRoom)) return;
         if (IsRepeatedDropEvent(game, monster, rowIndex, dropRoom,
-                dropX, dropY)) {
-            const auto suppressedCount =
-                SuppressedDuplicateDropCount.fetch_add(
-                    1, std::memory_order_acq_rel) + 1;
-            if constexpr (EnableDropOutcomeDiagnostics) {
-                char summary[192]{};
-                (void)std::snprintf(summary, sizeof(summary),
-                    "RandomTreasureDrop trace: callback=%u repeat suppressed at (%u,%u); suppressed=%u.",
-                    static_cast<unsigned>(matchedCallback),
-                    static_cast<unsigned>(dropX),
-                    static_cast<unsigned>(dropY),
-                    static_cast<unsigned>(suppressedCount));
-                Context->LogInfo(summary);
-            }
-            return;
-        }
-        if constexpr (EnableDropOutcomeDiagnostics) {
-            char summary[192]{};
-            (void)std::snprintf(summary, sizeof(summary),
-                "RandomTreasureDrop trace: matched callback=%u groups=%u at (%u,%u).",
-                static_cast<unsigned>(matchedCallback),
-                static_cast<unsigned>(matchingGroupCount),
-                static_cast<unsigned>(dropX),
-                static_cast<unsigned>(dropY));
-            Context->LogInfo(summary);
-        }
+                dropX, dropY)) return;
         std::vector<BonusDrop> earnedDrops;
-        std::vector<std::string> diagnosticMessages;
         {
             const std::lock_guard<std::mutex> lock(StateMutex);
             for (const auto& [selectedRow, ruleIndex] : ActiveRules) {
@@ -2017,32 +1778,12 @@ void __fastcall DropTreasureClassHook(
                     continue;
                 }
                 const auto totalWeight = nativeWeight + itemWeight;
-                if (totalWeight == 0) {
-                    continue;
-                }
-                const bool rollPassed = RandomBelow(totalWeight) >= nativeWeight;
-                if constexpr (EnableDropOutcomeDiagnostics) {
-                    char summary[192]{};
-                    (void)std::snprintf(summary, sizeof(summary),
-                        "RandomTreasureDrop trace: callback=%u item%u roll=%s.",
-                        static_cast<unsigned>(matchedCallback),
-                        static_cast<unsigned>(Rules[ruleIndex].number),
-                        rollPassed ? "passed" : "missed");
-                    diagnosticMessages.emplace_back(summary);
-                }
-                if (!rollPassed) continue;
+                if (totalWeight == 0
+                        || RandomBelow(totalWeight) < nativeWeight) continue;
                 const auto candidate = SelectItemCandidate(Rules[ruleIndex]);
                 if (candidate.packedCode == 0
                         || candidate.classId
                             == std::numeric_limits<std::uint32_t>::max()) {
-                    if constexpr (EnableDropOutcomeDiagnostics) {
-                        char summary[192]{};
-                        (void)std::snprintf(summary, sizeof(summary),
-                            "RandomTreasureDrop trace: callback=%u item%u passed its roll but had no resolved item candidate.",
-                            static_cast<unsigned>(matchedCallback),
-                            static_cast<unsigned>(Rules[ruleIndex].number));
-                        diagnosticMessages.emplace_back(summary);
-                    }
                     continue;
                 }
                 earnedDrops.push_back({
@@ -2055,9 +1796,6 @@ void __fastcall DropTreasureClassHook(
                     dropRoom,
                 });
             }
-        }
-        for (const auto& message : diagnosticMessages) {
-            Context->LogInfo(message.c_str());
         }
         for (const auto& drop : earnedDrops) {
             const auto nativeResult = CreateAndPlaceBonusDrop(game, player,
@@ -2168,12 +1906,6 @@ void __cdecl OnDataTablesLoaded(
         void*) noexcept {
     TableReady.store(false, std::memory_order_release);
     GameActive.store(false, std::memory_order_release);
-    NativeDropProbeLogged.store(false, std::memory_order_release);
-    NativeDropProbeCallCount.store(0, std::memory_order_release);
-    ObservedDropHookCount.store(0, std::memory_order_release);
-    MappedDropHookCount.store(0, std::memory_order_release);
-    MatchedDropCallbackCount.store(0, std::memory_order_release);
-    SuppressedDuplicateDropCount.store(0, std::memory_order_release);
     RuntimeTableRowCount.store(0, std::memory_order_release);
     RuntimeSourceRowOffset.store(0, std::memory_order_release);
     RuntimeTableRevision.store(0, std::memory_order_release);
@@ -2284,30 +2016,6 @@ void __cdecl OnDataTablesLoaded(
             + " sourceRowCount=" + std::to_string(TreasureClasses.size()) + ".";
         Context->LogInfo(validated.c_str());
 
-        if constexpr (EnableProbeLogging) {
-            constexpr std::array<std::string_view, 4> SnapshotRowNames{
-                "Gold",
-                "Jewelry C",
-                "Act 1 Chest A",
-                "Act 1 (H) Good Desecrated Herald",
-            };
-            for (const auto rowName : SnapshotRowNames) {
-                const auto source = TreasureClassByName.find(Lower(rowName));
-                if (source == TreasureClassByName.end()) continue;
-                const auto runtimeIndex = static_cast<std::size_t>(source->second)
-                    + matchedOffset;
-                if (runtimeIndex >= view.rowCount) continue;
-                const auto* row = base + runtimeIndex * view.rowSize;
-                std::int32_t rowPicks{};
-                if (!ReadMemory(row + TreasureClassPicksOffset,
-                        &rowPicks, sizeof(rowPicks))) {
-                    continue;
-                }
-                LogNativeDropProbe(row,
-                    nullptr, nullptr, nullptr, 0, 0, 0,
-                    nullptr, nullptr, 0, rowPicks);
-            }
-        }
     } catch (...) {
         Context->LogError(
             "RandomTreasureDrop: could not cache compiled Treasure Classes rows.");
@@ -2324,12 +2032,6 @@ void __cdecl OnGameJoined(
         return;
     }
     GameActive.store(false, std::memory_order_release);
-    NativeDropProbeLogged.store(false, std::memory_order_release);
-    NativeDropProbeCallCount.store(0, std::memory_order_release);
-    ObservedDropHookCount.store(0, std::memory_order_release);
-    MappedDropHookCount.store(0, std::memory_order_release);
-    MatchedDropCallbackCount.store(0, std::memory_order_release);
-    SuppressedDuplicateDropCount.store(0, std::memory_order_release);
     try {
     std::vector<std::string> selectionMessages;
     {
@@ -2418,36 +2120,7 @@ void __cdecl OnGameLeft(
                 D2RL::Lifecycle::GameplayEventRequiredSize)) {
         return;
     }
-    if (EnableProbeLogging && Context != nullptr) {
-        char summary[160]{};
-        (void)std::snprintf(summary, sizeof(summary),
-            "RandomTreasureDrop probe: GameLeft observed %u native hook calls; selected-table match observed=%s.",
-            static_cast<unsigned>(NativeDropProbeCallCount.load(
-                std::memory_order_acquire)),
-            NativeDropProbeLogged.load(std::memory_order_acquire)
-                ? "yes" : "no");
-        Context->LogInfo(summary);
-    }
-    if constexpr (EnableDropOutcomeDiagnostics) {
-        char summary[192]{};
-        (void)std::snprintf(summary, sizeof(summary),
-            "RandomTreasureDrop trace: game ended; callbacks=%u mapped=%u selected-matches=%u repeats-suppressed=%u.",
-            static_cast<unsigned>(ObservedDropHookCount.load(
-                std::memory_order_acquire)),
-            static_cast<unsigned>(MappedDropHookCount.load(
-                std::memory_order_acquire)),
-            static_cast<unsigned>(MatchedDropCallbackCount.load(
-                std::memory_order_acquire)),
-            static_cast<unsigned>(SuppressedDuplicateDropCount.load(
-                std::memory_order_acquire)));
-        Context->LogInfo(summary);
-    }
     GameActive.store(false, std::memory_order_release);
-    NativeDropProbeLogged.store(false, std::memory_order_release);
-    ObservedDropHookCount.store(0, std::memory_order_release);
-    MappedDropHookCount.store(0, std::memory_order_release);
-    MatchedDropCallbackCount.store(0, std::memory_order_release);
-    SuppressedDuplicateDropCount.store(0, std::memory_order_release);
     {
         const std::lock_guard<std::mutex> lock(StateMutex);
         ActiveRules.clear();
@@ -2648,7 +2321,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(
         return false;
     }
     Context->LogInfo(
-        "RandomTreasureDrop 0.1.40 diagnostic build: repeated same-source callbacks within 250 ms are suppressed; callback matches and bonus-roll outcomes are logged without naming rows. Zero path coordinates still fall back to the player's location.");
+        "RandomTreasureDrop 0.1.41: selected droptables are not named in the log; successful bonus drops are logged. Zero path coordinates still fall back to the player's location.");
     return true;
 }
 
@@ -2656,4 +2329,3 @@ D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     Shutdown();
     Context = nullptr;
 }
-
