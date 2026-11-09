@@ -229,7 +229,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = PluginId,
     .name = "Random Treasure Drop",
-    .version = "0.1.42",
+    .version = "0.1.43",
     .author = "MadMike",
     .description = "Adds independently rolled bonus drops at selected Treasure Class sources.",
     .flags = D2RL::PluginFlags::Server | D2RL::PluginFlags::NativeHooks,
@@ -2355,7 +2355,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(
         return false;
     }
     Context->LogInfo(
-        "RandomTreasureDrop 0.1.42: selected droptables are not named in the log; successful bonus drops are logged. Zero path coordinates still fall back to the player's location.");
+        "RandomTreasureDrop 0.1.43: selected droptables are not named in the log; successful bonus drops are logged. Zero path coordinates still fall back to the player's location.");
     return true;
 }
 
