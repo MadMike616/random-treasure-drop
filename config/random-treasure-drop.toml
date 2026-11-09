@@ -1,9 +1,10 @@
 # Random Treasure Drop configuration
 #
-# Each numbered group has three settings:
+# Each numbered group has four settings:
 #   itemN               One item code/type string or an array of choices. Each array entry has an equal chance when a bonus drop succeeds.
 #   weightN             Relative extra-item drop weight; this is the only weight setting. The maximum allowed value is 1000000.
 #   droptables_itemN    One Treasure Class row/special selector, or an array of them
+#   once_per_gameN      Optional true/false toggle. When true, that numbered group can produce at most one item per game. Defaults to false.
 # Numbered groups must use N from 1 through 10000 (maximum 10000 groups).
 #
 # Item codes are three or four characters. Prefix a type code with "type:", such as "type:swor".
@@ -31,10 +32,11 @@
 # droptables_itemN = ["desecrated:normal"]                     # Same as above
 # droptables_itemN = ["actboss:normal", "Act 1 Chest A"]       # First selects "actboss:normal" or "Act 1 Chest A" 50/50, then if "actboss:normal" was selected it selects a row in that pool.
 #
-# To add more entries, copy the three settings below and increment the number
+# To add more entries, copy the four settings below and increment the number
 # consistently. The blank placeholder is ignored until you fill it in.
 
 item1 = [""]
 weight1 = 1
 droptables_item1 = [""]
+once_per_game1 = false
 

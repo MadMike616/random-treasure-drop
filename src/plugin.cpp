@@ -32,7 +32,6 @@
 namespace {
 
 constexpr char PluginId[] = "random-treasure-drop";
-constexpr char SupportedBuildToken[] = "93847";
 constexpr std::uint64_t DropTreasureClassRva = 0x4404F0;
 constexpr std::uint64_t GetDynamicPathRva = 0x34AE80;
 constexpr std::uint64_t PathGetXRva = 0x341A20;
@@ -152,6 +151,7 @@ struct Rule {
     std::uint32_t itemWeight{1};
     std::vector<DropTableSelector> dropTableSelectors;
     std::vector<ItemOption> itemOptions;
+    bool oncePerGame{};
 };
 
 struct TreasureClassInfo {
@@ -185,6 +185,14 @@ struct BonusDrop {
     std::uint32_t x{};
     std::uint32_t y{};
     void* room{};
+    std::size_t ruleIndex{};
+    std::uint64_t gameGeneration{};
+    bool consumeAfterSuccess{};
+};
+
+struct RuleDropState {
+    bool consumed{};
+    bool pending{};
 };
 
 struct RecentDropEvent {
@@ -221,7 +229,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = PluginId,
     .name = "Random Treasure Drop",
-    .version = "0.1.41",
+    .version = "0.1.42",
     .author = "MadMike",
     .description = "Adds independently rolled bonus drops at selected Treasure Class sources.",
     .flags = D2RL::PluginFlags::Server | D2RL::PluginFlags::NativeHooks,
@@ -246,6 +254,8 @@ std::vector<TreasureClassInfo> TreasureClasses;
 std::unordered_map<std::string, std::uint32_t> TreasureClassByName;
 std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> TreasureClassByHash;
 std::vector<std::pair<std::uint32_t, std::size_t>> ActiveRules;
+std::vector<RuleDropState> RuleDropStates;
+std::uint64_t GameGeneration{};
 std::mutex StateMutex;
 std::mt19937_64 RandomEngine;
 std::atomic<bool> TableReady{};
@@ -444,6 +454,7 @@ struct PartialRule {
     bool hasItem{};
     bool hasItemWeight{};
     bool hasRows{};
+    bool hasOncePerGame{};
 };
 
 auto ValidCode(std::string_view code) noexcept -> bool {
@@ -598,6 +609,22 @@ auto ParseConfig(std::string_view text, std::vector<Rule>& parsed,
                 group.hasItemWeight = true;
                 group.rule.number = number;
                 group.rule.itemWeight = static_cast<std::uint32_t>(parsedInteger);
+                continue;
+            }
+            if (ParseNumberedKey(key, "once_per_game", number)) {
+                const std::string valueText = Lower(Trim(value));
+                if (valueText != "true" && valueText != "false") {
+                    error = key + " must be true or false";
+                    return false;
+                }
+                auto& group = groups[number];
+                if (group.hasOncePerGame) {
+                    error = key + " is repeated";
+                    return false;
+                }
+                group.hasOncePerGame = true;
+                group.rule.number = number;
+                group.rule.oncePerGame = valueText == "true";
                 continue;
             }
             error = "unknown or malformed key '" + key + "' on line "
@@ -1410,18 +1437,6 @@ auto SelectItemCandidate(const Rule& rule) -> ItemCandidate {
     return withQuality(candidates.back());
 }
 
-auto HasSupportedBuild(const D2RL::PluginContext* context) noexcept -> bool {
-    const char* values[] = {
-        context != nullptr ? context->buildName : nullptr,
-        context != nullptr ? context->buildVersion : nullptr,
-    };
-    return std::any_of(std::begin(values), std::end(values), [](const char* value) {
-        return value != nullptr
-            && (std::strcmp(value, SupportedBuildToken) == 0
-                || std::strstr(value, "3.3.93847") != nullptr);
-    });
-}
-
 auto IsExecutableAddress(std::uintptr_t address, std::size_t size) noexcept -> bool {
     MEMORY_BASIC_INFORMATION info{};
     if (VirtualQuery(reinterpret_cast<const void*>(address), &info,
@@ -1490,22 +1505,15 @@ auto InstallNativeDropHelpers() noexcept -> bool {
 }
 
 auto InstallDropHook() noexcept -> bool {
-    if (Context == nullptr || Context->exeBase == 0
-            || !HasSupportedBuild(Context)) {
-        if (Context != nullptr) {
-            Context->LogError(
-                "RandomTreasureDrop: native hook is limited to D2R build 3.3.93847.");
-        }
-        return false;
-    }
+    if (Context == nullptr || Context->exeBase == 0) return false;
     if (!InstallGroundCoordinateAccessors()) {
         Context->LogError(
-            "RandomTreasureDrop: the ground-coordinate accessors did not match the validated D2R 3.3.93847 layout; the drop hook was not installed.");
+            "RandomTreasureDrop: the ground-coordinate accessors did not match the expected native bytes; the drop hook was not installed.");
         return false;
     }
     if (!InstallNativeDropHelpers()) {
         Context->LogError(
-            "RandomTreasureDrop: the item-creation, ground-placement, or room helper signature did not match the validated D2R 3.3.93847 bytes; the drop hook was not installed.");
+            "RandomTreasureDrop: the item-creation, ground-placement, or room helper signature did not match the expected native bytes; the drop hook was not installed.");
         return false;
     }
     const auto address = Context->exeBase + DropTreasureClassRva;
@@ -1515,13 +1523,13 @@ auto InstallDropHook() noexcept -> bool {
         return false;
     }
 
-    // This signature was captured from the live D2R 3.3.93847 mapping. Keep it
-    // independent of the current bytes so an unknown prologue fails closed.
+    // Keep the validated signature independent of the current bytes so an
+    // unknown prologue fails closed.
     if (!Context->CheckExpectedBytes(DropTreasureClassRva,
             HookExpectedBytes.data(),
             static_cast<std::uint32_t>(HookExpectedBytes.size()))) {
         Context->LogError(
-            "RandomTreasureDrop: the 3.3.93847 Treasure Class hook signature did not match; the hook was not installed.");
+            "RandomTreasureDrop: the Treasure Class hook signature did not match the expected native bytes; the hook was not installed.");
         return false;
     }
     if (!Context->InstallInlineHook(DropTreasureClassRva,
@@ -1769,8 +1777,14 @@ void __fastcall DropTreasureClassHook(
             const std::lock_guard<std::mutex> lock(StateMutex);
             for (const auto& [selectedRow, ruleIndex] : ActiveRules) {
                 if (selectedRow != rowIndex || ruleIndex >= Rules.size()) continue;
-                const auto itemWeight = static_cast<std::uint64_t>(
-                    Rules[ruleIndex].itemWeight);
+                const auto& rule = Rules[ruleIndex];
+                if (rule.oncePerGame
+                        && (ruleIndex >= RuleDropStates.size()
+                            || RuleDropStates[ruleIndex].consumed
+                            || RuleDropStates[ruleIndex].pending)) {
+                    continue;
+                }
+                const auto itemWeight = static_cast<std::uint64_t>(rule.itemWeight);
                 const auto nativeWeight = TreasureClasses[sourceIndex].nativeWeight;
                 if (itemWeight == 0
                         || nativeWeight > std::numeric_limits<std::uint64_t>::max()
@@ -1780,27 +1794,42 @@ void __fastcall DropTreasureClassHook(
                 const auto totalWeight = nativeWeight + itemWeight;
                 if (totalWeight == 0
                         || RandomBelow(totalWeight) < nativeWeight) continue;
-                const auto candidate = SelectItemCandidate(Rules[ruleIndex]);
+                const auto candidate = SelectItemCandidate(rule);
                 if (candidate.packedCode == 0
                         || candidate.classId
                             == std::numeric_limits<std::uint32_t>::max()) {
                     continue;
                 }
                 earnedDrops.push_back({
-                    candidate.packedCode,
-                    candidate.classId,
-                    itemLevel,
-                    candidate.quality,
-                    dropX,
-                    dropY,
-                    dropRoom,
+                    .itemCode = candidate.packedCode,
+                    .itemClassId = candidate.classId,
+                    .itemLevel = itemLevel,
+                    .quality = candidate.quality,
+                    .x = dropX,
+                    .y = dropY,
+                    .room = dropRoom,
+                    .ruleIndex = ruleIndex,
+                    .gameGeneration = GameGeneration,
+                    .consumeAfterSuccess = rule.oncePerGame,
                 });
+                if (rule.oncePerGame) RuleDropStates[ruleIndex].pending = true;
             }
         }
         for (const auto& drop : earnedDrops) {
             const auto nativeResult = CreateAndPlaceBonusDrop(game, player,
                 drop.itemClassId, drop.itemLevel, drop.quality,
                 drop.room, drop.x, drop.y);
+            if (drop.consumeAfterSuccess) {
+                const std::lock_guard<std::mutex> lock(StateMutex);
+                if (drop.gameGeneration == GameGeneration
+                        && drop.ruleIndex < RuleDropStates.size()) {
+                    auto& state = RuleDropStates[drop.ruleIndex];
+                    state.pending = false;
+                    if (nativeResult == NativeDropResult::Success) {
+                        state.consumed = true;
+                    }
+                }
+            }
             if (nativeResult != NativeDropResult::Success) {
                 char message[192]{};
                 (void)std::snprintf(message, sizeof(message),
@@ -1909,6 +1938,16 @@ void __cdecl OnDataTablesLoaded(
     RuntimeTableRowCount.store(0, std::memory_order_release);
     RuntimeSourceRowOffset.store(0, std::memory_order_release);
     RuntimeTableRevision.store(0, std::memory_order_release);
+    {
+        const std::lock_guard<std::mutex> lock(StateMutex);
+        ++GameGeneration;
+        ActiveRules.clear();
+        RuleDropStates.clear();
+        TreasureClassByHash.clear();
+        RecentDropEvents.fill(RecentDropEvent{});
+        RecentDropEventNext = 0;
+        RecentDropEventCount = 0;
+    }
     if (context == nullptr || context != Context || DataTableService == nullptr
             || !D2RL::Lifecycle::HasDataTablesLoadedEventField(event,
                 D2RL::Lifecycle::DataTablesLoadedEventRequiredSize)) {
@@ -1997,10 +2036,6 @@ void __cdecl OnDataTablesLoaded(
         {
             const std::lock_guard<std::mutex> lock(StateMutex);
             TreasureClassByHash = std::move(hashes);
-            ActiveRules.clear();
-            RecentDropEvents.fill(RecentDropEvent{});
-            RecentDropEventNext = 0;
-            RecentDropEventCount = 0;
         }
         RuntimeTableRowCount.store(view.rowCount, std::memory_order_release);
         RuntimeSourceRowOffset.store(
@@ -2036,7 +2071,9 @@ void __cdecl OnGameJoined(
     std::vector<std::string> selectionMessages;
     {
         const std::lock_guard<std::mutex> lock(StateMutex);
+        ++GameGeneration;
         ActiveRules.clear();
+        RuleDropStates.assign(Rules.size(), RuleDropState{});
         RecentDropEvents.fill(RecentDropEvent{});
         RecentDropEventNext = 0;
         RecentDropEventCount = 0;
@@ -2123,7 +2160,9 @@ void __cdecl OnGameLeft(
     GameActive.store(false, std::memory_order_release);
     {
         const std::lock_guard<std::mutex> lock(StateMutex);
+        ++GameGeneration;
         ActiveRules.clear();
+        RuleDropStates.clear();
         RecentDropEvents.fill(RecentDropEvent{});
         RecentDropEventNext = 0;
         RecentDropEventCount = 0;
@@ -2200,7 +2239,9 @@ void Shutdown() noexcept {
     GameLeftListenerHandle = D2RL::Lifecycle::InvalidHandle;
     {
         const std::lock_guard<std::mutex> lock(StateMutex);
+        ++GameGeneration;
         ActiveRules.clear();
+        RuleDropStates.clear();
         RecentDropEvents.fill(RecentDropEvent{});
         RecentDropEventNext = 0;
         RecentDropEventCount = 0;
@@ -2302,13 +2343,6 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(
     } catch (...) {
         RandomEngine.seed(0xD2A11D0FULL);
     }
-    if (!HasSupportedBuild(context)) {
-        Context->LogError(
-            "RandomTreasureDrop: this build supports only D2R 3.3.93847; plugin load was refused.");
-        Shutdown();
-        Context = nullptr;
-        return false;
-    }
     if (!LoadConfiguredRules()) {
         Shutdown();
         Context = nullptr;
@@ -2321,7 +2355,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(
         return false;
     }
     Context->LogInfo(
-        "RandomTreasureDrop 0.1.41: selected droptables are not named in the log; successful bonus drops are logged. Zero path coordinates still fall back to the player's location.");
+        "RandomTreasureDrop 0.1.42: selected droptables are not named in the log; successful bonus drops are logged. Zero path coordinates still fall back to the player's location.");
     return true;
 }
 
@@ -2329,3 +2363,4 @@ D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     Shutdown();
     Context = nullptr;
 }
+

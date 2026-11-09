@@ -8,16 +8,17 @@ Random Treasure Drop is a D2RLoader plugin that creates independently rolled bon
 2. Place the DLL in D2RLoader's `plugins` folder and the TOML file in its `config` folder.
 3. Edit the TOML with item codes and Treasure Class row names available in the game's data files.
 
-The included TOML has one blank example group. It is ignored until configured. Copy its three settings and increment the number to add more groups.
+The included TOML has one blank example group. It is ignored until configured. Copy its four settings and increment the number to add more groups.
 
 ## Configuration
 
-Each numbered group has one or more item choices, an optional weight, and a non-empty list of Treasure Class rows or special selectors:
+Each numbered group has one or more item choices, an optional weight, a non-empty list of Treasure Class rows or special selectors, and an optional per-game limit toggle:
 
 ```toml
 item1 = ["pk1", "pk2", "type:armo, unique"]
 weight1 = 100
 droptables_item1 = ["Example Treasure Class"]
+once_per_game1 = true
 
 item2 = ["type:swor, magic"]
 weight2 = 10
@@ -34,6 +35,7 @@ Use numbered groups from `1` through `10000`; the plugin supports up to 10000 gr
 - Supported qualities are `lowquality` (also `inferior`), `normal`, `superior`, `magic`, `set`, `rare`, and `unique`.
 - `weightN`: the extra item's weight in the bonus-drop calculation. It defaults to `1` and must be from `1` through `1000000`.
 - `droptables_itemN`: one exact Treasure Class row name or special selector, or an array of them. Row names are matched without regard to letter case. For an array, the plugin first chooses one list entry uniformly. If that entry is a special selector, it then chooses one matching row uniformly from that selector's pool.
+- `once_per_gameN`: optional boolean, defaulting to `false`. Set it to `true` to allow that numbered group to produce at most one bonus item during a game. The setting is tracked independently by entry number, so identical entries can each produce one item. A group is consumed only after its bonus item is successfully created; it resets when entering a new game.
 
 The special selectors are:
 
@@ -55,7 +57,7 @@ For each group, every entry in its list has an equal chance of selection. If `ac
 
 ## Drop behavior
 
-When a character enters a game, the plugin selects one row for each configured item group. It clears those selections when the character leaves the game. Each distinct evaluation of a selected row gets one independent bonus-drop roll per matching group; the row's `Picks` value does not repeat that roll. Groups that select the same row roll independently. To avoid duplicate rewards when D2R repeats the same source callback, evaluations for the same source unit or exact source location and row within 250 milliseconds are treated as one event.
+When a character enters a game, the plugin selects one row for each configured item group. It clears those selections and the per-entry usage limits when the character leaves the game. Each distinct evaluation of a selected row gets one independent bonus-drop roll per eligible matching group; the row's `Picks` value does not repeat that roll. Groups that select the same row roll independently. To avoid duplicate rewards when D2R repeats the same source callback, evaluations for the same source unit or exact source location and row within 250 milliseconds are treated as one event.
 
 The bonus chance for a group is:
 
@@ -73,7 +75,7 @@ Logs confirm group selections and successful bonus drops. They never identify th
 
 ## Compatibility
 
-The native drop hook and supporting game functions are validated for D2R build `3.3.93847`. The plugin requires D2RLoader PluginSDK ABI 4, including its lifecycle and data-table services. It checks the expected game-code signatures and Treasure Class table layout, and leaves the hook uninstalled if validation fails.
+Verified with D2R builds `3.3.93847` and `3.4.95032`. The plugin requires D2RLoader PluginSDK ABI 4, including its lifecycle and data-table services. It does not gate loading on a specific D2R version; before installing the native drop hook, it checks expected game-code signatures and the Treasure Class table layout, and leaves the hook uninstalled if validation fails.
 
 ## Build
 
@@ -89,3 +91,4 @@ The build fetches a pinned D2RLoader PluginSDK revision. To build offline, confi
 ## License
 
 This project is distributed under the MIT License. See [LICENSE](LICENSE).
+
