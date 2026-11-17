@@ -4,7 +4,7 @@ Random Treasure Drop is a D2RLoader plugin that creates independently rolled bon
 
 ## Install
 
-Automatic table setup requires v1.1.43 or later and D2RLoader with Plugin ABI 4 support. If that version isn't on the Releases page yet, you can build it from the source below. In the standard mod layout, the loose game data is in `mods/<ModName>/<ModName>.mpq/data/`, where `<ModName>.mpq` is a directory. The mod must be writable if the installer needs to add missing tables.
+Automatic table setup is available in v1.1.43 and later. You need D2RLoader with Plugin ABI 4 support. In the standard mod layout, the loose game data is in `mods/<ModName>/<ModName>.mpq/data/`, where `<ModName>.mpq` is a directory. The mod must be writable if the installer needs to add missing tables.
 
 1. Check which files your configuration needs using the table below. Keep the mod's existing loose files and reuse any originals already under `mods/<ModName>/d2rloader/plugins/basefiles-and-backups/basefiles/`. Use Ladik's Casc Viewer to extract missing originals from your installed game. For example, save `data/global/excel/treasureclassex.txt` from CASC as `basefiles/global/excel/treasureclassex.txt` (leave out the leading `data/`).
 2. With the game closed, download the DLL and TOML from the [Releases page](https://github.com/MadMike616/random-treasure-drop/releases). Put the DLL in `mods/<ModName>/d2rloader/plugins/` and the TOML in `mods/<ModName>/d2rloader/config/`. If you already have a TOML, keep it. Configure the item codes and Treasure Class selectors you want to use.
