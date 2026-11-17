@@ -4,9 +4,23 @@ Random Treasure Drop is a D2RLoader plugin that creates independently rolled bon
 
 ## Install
 
-1. Download `d2rl-random-treasure-drop.dll` and `random-treasure-drop.toml` from the [latest release](https://github.com/MadMike616/random-treasure-drop/releases/latest).
-2. Place the DLL in D2RLoader's `plugins` folder and the TOML file in its `config` folder.
-3. Edit the TOML with item codes and Treasure Class row names available in the game's data files.
+Automatic table setup requires v1.1.43 or later and D2RLoader with Plugin ABI 4 support. If that version isn't on the Releases page yet, you can build it from the source below. In the standard mod layout, the loose game data is in `mods/<ModName>/<ModName>.mpq/data/`, where `<ModName>.mpq` is a directory. The mod must be writable if the installer needs to add missing tables.
+
+1. Check which files your configuration needs using the table below. Keep the mod's existing loose files and reuse any originals already under `mods/<ModName>/d2rloader/plugins/basefiles-and-backups/basefiles/`. Use Ladik's Casc Viewer to extract missing originals from your installed game. For example, save `data/global/excel/treasureclassex.txt` from CASC as `basefiles/global/excel/treasureclassex.txt` (leave out the leading `data/`).
+2. With the game closed, download the DLL and TOML from the [Releases page](https://github.com/MadMike616/random-treasure-drop/releases). Put the DLL in `mods/<ModName>/d2rloader/plugins/` and the TOML in `mods/<ModName>/d2rloader/config/`. If you already have a TOML, keep it. Configure the item codes and Treasure Class selectors you want to use.
+3. Start D2RLoader with the mod selected. If the log reports `first-run table setup complete`, exit and restart D2RLoader with the same mod so the game loads the copied tables. If the files were already in the mod, no setup restart is needed.
+
+| File under `data/global/excel/` or `basefiles/global/excel/` | When it is needed |
+| --- | --- |
+| `treasureclassex.txt` | For every configured entry, including `any` and `desecrated`. |
+| `weapons.txt`, `armor.txt`, `misc.txt` | Supply the tables containing the configured item codes or the items you want `type:` entries to choose from. |
+| `itemtypes.txt` | Optional for `type:` entries. It allows matches through related child types. |
+| `monstats.txt` | For `actboss`, including difficulty suffixes. |
+| `superuniques.txt` | For `superunique`, including difficulty suffixes. |
+
+The plugin prefers the mod's loose copy of each table and checks the mod's `data/global/excel/base/` folder before using the shared originals. It validates the entries against the available tables before copying anything. If a required input is missing, check the paths in the log, supply the file, and launch again. Use originals from the same game data your mod uses.
+
+First-run table copies use the shared mod-install lock, so they wait for any other D2RLoader plugin installer using that lock to finish its backups and writes. The installer only creates missing files and leaves both the mod's existing tables and the shared originals untouched, so it creates no backups of existing files.
 
 The included TOML has one blank example group. It is ignored until configured. Copy its four settings and increment the number to add more groups.
 
@@ -91,4 +105,3 @@ The build fetches a pinned D2RLoader PluginSDK revision. To build offline, confi
 ## License
 
 This project is distributed under the MIT License. See [LICENSE](LICENSE).
-

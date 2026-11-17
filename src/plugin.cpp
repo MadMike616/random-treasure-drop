@@ -22,8 +22,10 @@
 #include <mutex>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -229,7 +231,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = PluginId,
     .name = "Random Treasure Drop",
-    .version = "0.1.43",
+    .version = "1.1.43",
     .author = "MadMike",
     .description = "Adds independently rolled bonus drops at selected Treasure Class sources.",
     .flags = D2RL::PluginFlags::Server | D2RL::PluginFlags::NativeHooks,
@@ -757,28 +759,204 @@ auto DataRoots(const D2RL::PluginContext* context)
     return roots;
 }
 
-auto FindExcelFile(const std::vector<std::filesystem::path>& roots,
-        std::string_view fileName, bool preferBase)
-        -> std::filesystem::path {
-    const std::filesystem::path name = Utf8Path(fileName);
-    for (const auto& root : roots) {
-        std::array<std::filesystem::path, 2> candidates{};
-        if (preferBase) {
-            candidates = {root / L"data/global/excel/base" / name,
-                root / L"data/global/excel" / name};
-        } else {
-            candidates = {root / L"data/global/excel" / name,
-                root / L"data/global/excel/base" / name};
+namespace fs = std::filesystem;
+
+// Match the mutex used by the other D2RLoader mod data installers.
+class ModInstallLock {
+public:
+    ModInstallLock() {
+        handle_ = CreateMutexW(nullptr, FALSE, L"Local\\D2RLoader.ModFirstRunInstall.v1");
+        if (handle_ == nullptr) {
+            throw std::system_error(GetLastError(), std::system_category(),
+                "could not create the shared mod-install lock");
         }
-        for (const auto& candidate : candidates) {
-            std::error_code error;
-            if (std::filesystem::is_regular_file(candidate, error) && !error) {
-                return candidate;
+        const auto wait = WaitForSingleObject(handle_, 60000);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED) {
+            const auto error = GetLastError();
+            CloseHandle(handle_);
+            if (wait == WAIT_TIMEOUT) {
+                throw std::runtime_error("timed out waiting for the shared mod-install lock");
             }
+            throw std::system_error(error, std::system_category(),
+                "could not acquire the shared mod-install lock");
+        }
+    }
+
+    ModInstallLock(const ModInstallLock&) = delete;
+    auto operator=(const ModInstallLock&) -> ModInstallLock& = delete;
+
+    ~ModInstallLock() {
+        ReleaseMutex(handle_);
+        CloseHandle(handle_);
+    }
+
+private:
+    HANDLE handle_{};
+};
+
+auto DisplayPath(fs::path path) -> std::string {
+    const auto utf8 = path.make_preferred().u8string();
+    return std::string(utf8.begin(), utf8.end());
+}
+
+auto SamePathPart(const fs::path& left, const fs::path& right) -> bool {
+    return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE)
+        == CSTR_EQUAL;
+}
+
+auto CheckedChild(const fs::path& root, const fs::path& relative) -> fs::path {
+    const auto target = root / relative;
+    const auto resolved = fs::weakly_canonical(target);
+    auto part = resolved.begin();
+    for (const auto& expected : root) {
+        if (part == resolved.end() || !SamePathPart(*part, expected)) {
+            throw std::runtime_error("table path is outside the active mod: "
+                + DisplayPath(target));
+        }
+        ++part;
+    }
+    return target;
+}
+
+auto IsLooseFile(const fs::path& path) -> bool {
+    std::error_code ec;
+    return fs::is_regular_file(path, ec);
+}
+
+auto FindModDataRoot(const D2RL::PluginContext& context,
+        const std::vector<fs::path>& roots) -> fs::path {
+    if (context.activeMod == nullptr || context.activeMod[0] == '\0') return {};
+    const auto mod = Utf8Path(context.activeMod);
+    if (mod.has_root_path() || mod.has_parent_path() || mod == L"."
+            || mod == L".." || mod.native().find(L':') != std::wstring::npos) {
+        return {};
+    }
+    const fs::path package(mod.native() + L".mpq");
+    for (const auto& root : roots) {
+        std::error_code ec;
+        if (root.is_absolute() && SamePathPart(root.filename(), package)
+                && SamePathPart(root.parent_path().filename(), mod)
+                && fs::is_directory(root, ec)) {
+            return fs::canonical(root);
+        }
+    }
+    for (const auto& root : roots) {
+        std::error_code ec;
+        if (root.is_absolute() && SamePathPart(root.filename(), mod)
+                && fs::is_directory(root / L"data", ec)) {
+            return fs::canonical(root);
         }
     }
     return {};
 }
+
+class ExcelSetup {
+public:
+    explicit ExcelSetup(const D2RL::PluginContext& context)
+        : roots_(DataRoots(&context)), dataRoot_(FindModDataRoot(context, roots_)) {
+        if (!dataRoot_.empty()) {
+            modRoot_ = SamePathPart(dataRoot_.extension(), L".mpq")
+                ? dataRoot_.parent_path() : dataRoot_;
+        }
+    }
+
+    auto Loose(std::string_view name) const -> fs::path {
+        const auto file = Utf8Path(name);
+        const auto find = [&](const fs::path& root) -> fs::path {
+            const auto excel = root / L"data/global/excel";
+            for (const auto& candidate : {excel / file, excel / L"base" / file}) {
+                if (IsLooseFile(candidate)) return candidate;
+            }
+            return {};
+        };
+        if (!dataRoot_.empty()) return find(dataRoot_);
+        for (const auto& root : roots_) {
+            if (auto path = find(root); !path.empty()) return path;
+        }
+        return {};
+    }
+
+    auto Base(std::string_view name) const -> fs::path {
+        if (modRoot_.empty()) return {};
+        const auto source = CheckedChild(modRoot_, BaseExcel / Utf8Path(name));
+        return IsLooseFile(source) ? source : fs::path{};
+    }
+
+    void Queue(std::string_view name, const fs::path& base) {
+        auto target = CheckedChild(dataRoot_, LooseExcel / Utf8Path(name));
+        copies_.emplace(std::move(target), base);
+    }
+
+    auto Required(std::string_view name, std::string& error) -> fs::path {
+        auto path = Loose(name);
+        if (!path.empty()) return path;
+        path = Base(name);
+        if (!path.empty()) {
+            Queue(name, path);
+        } else if (!modRoot_.empty()) {
+            error = "required table missing: " + DisplayPath(dataRoot_ / LooseExcel / Utf8Path(name))
+                + ". Put an extracted copy here: " + DisplayPath(modRoot_ / BaseExcel / Utf8Path(name));
+        } else {
+            error = std::string(name)
+                + " was not found in the loose data. Copying from basefiles requires an unpacked, writable mod.";
+        }
+        return path;
+    }
+
+    auto ItemTableLocations() const -> std::string {
+        if (modRoot_.empty()) return " in the loose data of the active mod";
+        return " in " + DisplayPath(dataRoot_ / LooseExcel)
+            + " or " + DisplayPath(modRoot_ / BaseExcel);
+    }
+
+    // Called only after the inputs and TOML resolve successfully, while holding the shared lock.
+    auto CopyMissing() const -> std::size_t {
+        if (copies_.empty()) return 0;
+        const auto excel = CheckedChild(dataRoot_, LooseExcel);
+        fs::create_directories(excel);
+        const auto staging = CheckedChild(dataRoot_, LooseExcel /
+            (L".rtd-install-" + std::to_wstring(GetCurrentProcessId())
+                + L"-" + std::to_wstring(GetTickCount64())));
+        if (!fs::create_directory(staging)) {
+            throw std::runtime_error("could not create staging directory: " + DisplayPath(staging));
+        }
+        const auto cleanup = [&]() noexcept {
+            std::error_code ignored;
+            // Only remove known entries from the private staging directory.
+            for (const auto& [target, source] : copies_) {
+                fs::remove(staging / target.filename(), ignored);
+            }
+            fs::remove(staging, ignored);
+        };
+        try {
+            for (const auto& [target, source] : copies_) {
+                fs::copy_file(source, staging / target.filename());
+            }
+            for (const auto& [target, source] : copies_) {
+                // No replace flag: an existing file is never overwritten.
+                if (!MoveFileExW((staging / target.filename()).c_str(),
+                        target.c_str(), MOVEFILE_WRITE_THROUGH)) {
+                    const auto error = GetLastError();
+                    throw std::system_error(error, std::system_category(),
+                        "could not add loose table " + DisplayPath(target));
+                }
+            }
+        } catch (...) {
+            cleanup();
+            throw;
+        }
+        cleanup();
+        return copies_.size();
+    }
+
+private:
+    static inline const fs::path LooseExcel{L"data/global/excel"};
+    static inline const fs::path BaseExcel{L"d2rloader/plugins/basefiles-and-backups/basefiles/global/excel"};
+    std::vector<fs::path> roots_;
+    fs::path dataRoot_;
+    fs::path modRoot_;
+    std::map<fs::path, fs::path> copies_;
+};
 
 auto ReadTsv(const std::filesystem::path& path, TableText& table,
         std::string& error) -> bool {
@@ -873,15 +1051,12 @@ auto RowsEqualExceptPicks(const void* left, const void* right) noexcept -> bool 
             CompiledTreasureClassRowSize - end) == 0;
 }
 
-auto ParseTreasureClasses(const std::vector<std::filesystem::path>& roots,
+auto ParseTreasureClasses(ExcelSetup& setup,
         std::vector<TreasureClassInfo>& rows,
         std::unordered_map<std::string, std::uint32_t>& byName,
         std::string& error) -> bool {
-    const auto path = FindExcelFile(roots, "treasureclassex.txt", false);
-    if (path.empty()) {
-        error = "treasureclassex.txt was not found in the active mod files";
-        return false;
-    }
+    const auto path = setup.Required("treasureclassex.txt", error);
+    if (path.empty()) return false;
     TableText table;
     if (!ReadTsv(path, table, error)) return false;
     const auto nameColumn = ColumnIndex(table, "Treasure Class");
@@ -959,15 +1134,10 @@ auto AddSelectorRow(std::string_view rowName,
     return true;
 }
 
-auto CollectActBossRows(const std::vector<std::filesystem::path>& roots,
+auto CollectActBossRows(const fs::path& path,
         std::string_view difficultySuffix,
         const std::unordered_map<std::string, std::uint32_t>& rowsByName,
         std::set<std::uint32_t>& rowIndices, std::string& error) -> bool {
-    const auto path = FindExcelFile(roots, "monstats.txt", false);
-    if (path.empty()) {
-        error = "monstats.txt was not found for the actboss selector";
-        return false;
-    }
     TableText table;
     if (!ReadTsv(path, table, error)) return false;
     const auto idColumn = ColumnIndex(table, "Id");
@@ -1028,15 +1198,10 @@ auto CollectActBossRows(const std::vector<std::filesystem::path>& roots,
     return true;
 }
 
-auto CollectSuperUniqueRows(const std::vector<std::filesystem::path>& roots,
+auto CollectSuperUniqueRows(const fs::path& path,
         std::string_view difficultySuffix,
         const std::unordered_map<std::string, std::uint32_t>& rowsByName,
         std::set<std::uint32_t>& rowIndices, std::string& error) -> bool {
-    const auto path = FindExcelFile(roots, "superuniques.txt", false);
-    if (path.empty()) {
-        error = "superuniques.txt was not found for the superunique selector";
-        return false;
-    }
     TableText table;
     if (!ReadTsv(path, table, error)) return false;
     std::string baseColumnName("TC");
@@ -1060,7 +1225,7 @@ auto CollectSuperUniqueRows(const std::vector<std::filesystem::path>& roots,
 }
 
 auto ResolveDropTableSelectors(std::vector<Rule>& rules,
-        const std::vector<std::filesystem::path>& roots,
+        ExcelSetup& setup,
         const std::vector<TreasureClassInfo>& treasureClasses,
         const std::unordered_map<std::string, std::uint32_t>& rowsByName,
         std::string& error) -> bool {
@@ -1125,6 +1290,8 @@ auto ResolveDropTableSelectors(std::vector<Rule>& rules,
 
     std::unordered_map<std::string, std::vector<std::uint32_t>> specialRows;
     if (needsActBoss) {
+        const auto path = setup.Required("monstats.txt", error);
+        if (path.empty()) return false;
         constexpr std::array<std::pair<std::string_view, std::string_view>, 3>
             Difficulties{{
                 {"normal", ""}, {"nightmare", "(N)"}, {"hell", "(H)"},
@@ -1132,7 +1299,7 @@ auto ResolveDropTableSelectors(std::vector<Rule>& rules,
         std::set<std::uint32_t> allRows;
         for (const auto& [difficulty, suffix] : Difficulties) {
             std::set<std::uint32_t> difficultyRows;
-            if (!CollectActBossRows(roots, suffix, rowsByName,
+            if (!CollectActBossRows(path, suffix, rowsByName,
                     difficultyRows, error)) {
                 error = "actboss:" + std::string(difficulty) + ": " + error;
                 return false;
@@ -1146,6 +1313,8 @@ auto ResolveDropTableSelectors(std::vector<Rule>& rules,
             std::vector<std::uint32_t>(allRows.begin(), allRows.end()));
     }
     if (needsSuperUnique) {
+        const auto path = setup.Required("superuniques.txt", error);
+        if (path.empty()) return false;
         constexpr std::array<std::pair<std::string_view, std::string_view>, 3>
             Difficulties{{
                 {"normal", ""}, {"nightmare", "(N)"}, {"hell", "(H)"},
@@ -1153,7 +1322,7 @@ auto ResolveDropTableSelectors(std::vector<Rule>& rules,
         std::set<std::uint32_t> allRows;
         for (const auto& [difficulty, suffix] : Difficulties) {
             std::set<std::uint32_t> difficultyRows;
-            if (!CollectSuperUniqueRows(roots, suffix, rowsByName,
+            if (!CollectSuperUniqueRows(path, suffix, rowsByName,
                     difficultyRows, error)) {
                 error = "superunique:" + std::string(difficulty) + ": "
                     + error;
@@ -1276,61 +1445,119 @@ struct SourceItem {
     std::uint32_t rarity{};
 };
 
-auto ReadItemSources(const std::vector<std::filesystem::path>& roots,
-        std::vector<SourceItem>& items,
-        std::vector<TypeEquivalence>& types,
+auto ReadItemTypes(const fs::path& path, std::vector<TypeEquivalence>& types,
         std::string& error) -> bool {
-    items.clear();
-    types.clear();
-    const auto itemTypesPath = FindExcelFile(roots, "itemtypes.txt", false);
-    if (!itemTypesPath.empty()) {
-        TableText table;
-        if (!ReadTsv(itemTypesPath, table, error)) return false;
-        const auto codeColumn = ColumnIndex(table, "Code");
-        const auto equiv1Column = ColumnIndex(table, "Equiv1");
-        const auto equiv2Column = ColumnIndex(table, "Equiv2");
-        if (codeColumn == std::numeric_limits<std::size_t>::max()) {
-            error = "itemtypes.txt is missing its Code column";
-            return false;
-        }
-        for (const auto& row : table.rows) {
-            const auto code = Lower(Cell(row, codeColumn));
-            if (code.empty()) continue;
-            types.push_back({code, Lower(Cell(row, equiv1Column)),
-                Lower(Cell(row, equiv2Column))});
+    TableText table;
+    if (!ReadTsv(path, table, error)) return false;
+    const auto codeColumn = ColumnIndex(table, "Code");
+    const auto equiv1Column = ColumnIndex(table, "Equiv1");
+    const auto equiv2Column = ColumnIndex(table, "Equiv2");
+    if (codeColumn == std::numeric_limits<std::size_t>::max()) {
+        error = "itemtypes.txt is missing its Code column";
+        return false;
+    }
+    for (const auto& row : table.rows) {
+        const auto code = Lower(Cell(row, codeColumn));
+        if (code.empty()) continue;
+        types.push_back({code, Lower(Cell(row, equiv1Column)),
+            Lower(Cell(row, equiv2Column))});
+    }
+    return true;
+}
+
+void ExpandItemTypes(std::unordered_set<std::string>& accepted,
+        const std::vector<TypeEquivalence>& types) {
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& type : types) {
+            if ((!type.parent1.empty() && accepted.contains(type.parent1))
+                    || (!type.parent2.empty() && accepted.contains(type.parent2))) {
+                if (accepted.insert(type.code).second) changed = true;
+            }
         }
     }
+}
 
+auto ReadItemFile(const fs::path& path, std::vector<SourceItem>& items,
+        std::string& error) -> bool {
+    TableText table;
+    if (!ReadTsv(path, table, error)) return false;
+    const auto codeColumn = ColumnIndex(table, "code");
+    const auto type1Column = ColumnIndex(table, "type");
+    const auto type2Column = ColumnIndex(table, "type2");
+    const auto rarityColumn = ColumnIndex(table, "rarity");
+    if (codeColumn == std::numeric_limits<std::size_t>::max()) {
+        error = DisplayPath(path) + " is missing its code column";
+        return false;
+    }
+    for (const auto& row : table.rows) {
+        const auto code = Lower(Cell(row, codeColumn));
+        if (!ValidCode(code)) continue;
+        const auto rarityValue = ParseSignedCell(Cell(row, rarityColumn), 1);
+        const auto rarity = rarityValue > 0
+            ? static_cast<std::uint32_t>(std::min<std::int64_t>(rarityValue, 1000000))
+            : 1U;
+        items.push_back({code, Lower(Cell(row, type1Column)),
+            Lower(Cell(row, type2Column)), rarity});
+    }
+    return true;
+}
+
+auto ReadItemSources(ExcelSetup& setup, const std::vector<Rule>& rules,
+        std::vector<SourceItem>& items, std::vector<TypeEquivalence>& types,
+        std::string& error) -> bool {
+    std::unordered_set<std::string> missingCodes;
+    std::unordered_set<std::string> requestedTypes;
+    for (const auto& rule : rules) {
+        for (const auto& spec : rule.itemSpecs) {
+            const auto code = Lower(spec.itemCode);
+            if (code.starts_with("type:")) requestedTypes.insert(code.substr(5));
+            else missingCodes.insert(code);
+        }
+    }
+    if (!requestedTypes.empty()) {
+        auto path = setup.Loose("itemtypes.txt");
+        if (path.empty()) {
+            path = setup.Base("itemtypes.txt");
+            if (!path.empty()) setup.Queue("itemtypes.txt", path);
+        }
+        if (!path.empty() && !ReadItemTypes(path, types, error)) return false;
+        ExpandItemTypes(requestedTypes, types);
+    }
     constexpr std::array<std::string_view, 3> itemFiles{
         "weapons.txt", "armor.txt", "misc.txt"};
-    std::unordered_set<std::string> seen;
-    for (const auto file : itemFiles) {
-        const auto path = FindExcelFile(roots, file, false);
+    std::array<std::vector<SourceItem>, itemFiles.size()> tables;
+    std::array<bool, itemFiles.size()> hasLoose{};
+    for (std::size_t i = 0; i < itemFiles.size(); ++i) {
+        const auto path = setup.Loose(itemFiles[i]);
         if (path.empty()) continue;
-        TableText table;
-        if (!ReadTsv(path, table, error)) return false;
-        const auto codeColumn = ColumnIndex(table, "code");
-        const auto type1Column = ColumnIndex(table, "type");
-        const auto type2Column = ColumnIndex(table, "type2");
-        const auto rarityColumn = ColumnIndex(table, "rarity");
-        if (codeColumn == std::numeric_limits<std::size_t>::max()) {
-            error = std::string(file) + " is missing its code column";
-            return false;
-        }
-        for (const auto& row : table.rows) {
-            const auto code = Lower(Cell(row, codeColumn));
-            if (!ValidCode(code) || !seen.insert(code).second) continue;
-            const auto rarityValue = ParseSignedCell(Cell(row, rarityColumn), 1);
-            const auto rarity = rarityValue > 0
-                ? static_cast<std::uint32_t>(std::min<std::int64_t>(rarityValue, 1000000))
-                : 1U;
-            items.push_back({code, Lower(Cell(row, type1Column)),
-                Lower(Cell(row, type2Column)), rarity});
+        hasLoose[i] = true;
+        if (!ReadItemFile(path, tables[i], error)) return false;
+        for (const auto& item : tables[i]) missingCodes.erase(item.code);
+    }
+    for (std::size_t i = 0; i < itemFiles.size(); ++i) {
+        if (hasLoose[i] || (missingCodes.empty() && requestedTypes.empty())) continue;
+        const auto path = setup.Base(itemFiles[i]);
+        if (path.empty()) continue;
+        std::vector<SourceItem> baseItems;
+        if (!ReadItemFile(path, baseItems, error)) return false;
+        const auto matchesConfig = [&](const SourceItem& item) {
+            return missingCodes.contains(item.code)
+                || requestedTypes.contains(item.type1)
+                || requestedTypes.contains(item.type2);
+        };
+        if (std::any_of(baseItems.begin(), baseItems.end(), matchesConfig)) {
+            setup.Queue(itemFiles[i], path);
+            for (const auto& item : baseItems) missingCodes.erase(item.code);
+            tables[i] = std::move(baseItems);
         }
     }
-    if (items.empty()) {
-        error = "no valid item rows were found in the active mod files";
-        return false;
+    std::unordered_set<std::string> seen;
+    for (auto& table : tables) {
+        for (auto& item : table) {
+            if (seen.insert(item.code).second) items.push_back(std::move(item));
+        }
     }
     return true;
 }
@@ -1370,20 +1597,7 @@ auto ResolveRuleItems(std::vector<Rule>& rules,
             }
 
             std::unordered_set<std::string> acceptedTypes{code};
-            bool changed = true;
-            while (changed) {
-                changed = false;
-                for (const auto& type : types) {
-                    if (acceptedTypes.contains(type.code)) continue;
-                    if ((!type.parent1.empty()
-                            && acceptedTypes.contains(type.parent1))
-                            || (!type.parent2.empty()
-                                && acceptedTypes.contains(type.parent2))) {
-                        acceptedTypes.insert(type.code);
-                        changed = true;
-                    }
-                }
-            }
+            ExpandItemTypes(acceptedTypes, types);
             for (const auto& item : items) {
                 if (acceptedTypes.contains(item.type1)
                         || acceptedTypes.contains(item.type2)) {
@@ -1920,13 +2134,7 @@ auto ResolveNativeItemClassIds(std::uint64_t revision) noexcept -> bool {
             }
         }
     }
-    if (resolved == 0) return Rules.empty();
-    char message[160]{};
-    (void)std::snprintf(message, sizeof(message),
-        "RandomTreasureDrop: resolved %u configured item candidates to native class IDs.",
-        static_cast<unsigned>(resolved));
-    Context->LogInfo(message);
-    return true;
+    return resolved != 0 || Rules.empty();
 }
 
 void __cdecl OnDataTablesLoaded(
@@ -1970,27 +2178,14 @@ void __cdecl OnDataTablesLoaded(
             || view.rowCount == 0
             || view.rowSize != CompiledTreasureClassRowSize
             || view.rowCount < TreasureClasses.size()) {
-        const std::string diagnostic =
-            "RandomTreasureDrop: compiled Treasure Classes table validation failed; custom drops are disabled. result="
-            + std::to_string(static_cast<std::uint32_t>(result))
-            + " eventRevision=" + std::to_string(event->revision)
-            + " viewRevision=" + std::to_string(view.revision)
-            + " tableId=" + std::to_string(static_cast<std::uint32_t>(view.tableId))
-            + " bank=" + std::to_string(static_cast<std::uint32_t>(view.bank))
-            + " rows=" + std::to_string(reinterpret_cast<std::uintptr_t>(view.rows))
-            + " runtimeRowCount=" + std::to_string(view.rowCount)
-            + " parsedRowCount=" + std::to_string(TreasureClasses.size())
-            + " runtimeRowSize=" + std::to_string(view.rowSize)
-            + " expectedRowSize=" + std::to_string(CompiledTreasureClassRowSize) + ".";
-        Context->LogError(diagnostic.c_str());
+        Context->LogError(
+            "RandomTreasureDrop: compiled Treasure Class table validation failed. Check D2R and D2RLoader compatibility and use the TreasureClassEx.txt that matches the active mod. Bonus drops are disabled.");
         return;
     }
     const auto* base = static_cast<const std::uint8_t*>(view.rows);
     const std::size_t lastOffset = view.rowCount - TreasureClasses.size();
     std::size_t matchedOffset = std::numeric_limits<std::size_t>::max();
     std::size_t exactMatches{};
-    std::size_t bestOffset{};
-    std::size_t bestMatchingRows{};
     for (std::size_t offset = 0; offset <= lastOffset; ++offset) {
         std::size_t matchingRows{};
         for (std::size_t sourceIndex = 0;
@@ -2004,24 +2199,14 @@ void __cdecl OnDataTablesLoaded(
                 ++matchingRows;
             }
         }
-        if (matchingRows > bestMatchingRows) {
-            bestOffset = offset;
-            bestMatchingRows = matchingRows;
-        }
         if (matchingRows == TreasureClasses.size()) {
             matchedOffset = offset;
             ++exactMatches;
         }
     }
     if (exactMatches != 1) {
-        const std::string diagnostic =
-            "RandomTreasureDrop: could not uniquely align source rows with compiled Treasure Classes; custom drops are disabled. exactAlignments="
-            + std::to_string(exactMatches)
-            + " bestRuntimeOffset=" + std::to_string(bestOffset)
-            + " matchingPicks=" + std::to_string(bestMatchingRows)
-            + " sourceRowCount=" + std::to_string(TreasureClasses.size())
-            + " runtimeRowCount=" + std::to_string(view.rowCount) + ".";
-        Context->LogError(diagnostic.c_str());
+        Context->LogError(
+            "RandomTreasureDrop: TreasureClassEx.txt could not be matched to the compiled table. Check that the loose file matches the active mod and restart D2RLoader. Bonus drops are disabled.");
         return;
     }
     try {
@@ -2043,14 +2228,6 @@ void __cdecl OnDataTablesLoaded(
             std::memory_order_release);
         RuntimeTableRevision.store(view.revision, std::memory_order_release);
         TableReady.store(true, std::memory_order_release);
-        const std::string validated =
-            "RandomTreasureDrop: compiled Treasure Classes rows aligned uniquely by Picks; runtimeOffset="
-            + std::to_string(matchedOffset)
-            + " runtimeRowCount="
-            + std::to_string(view.rowCount)
-            + " sourceRowCount=" + std::to_string(TreasureClasses.size()) + ".";
-        Context->LogInfo(validated.c_str());
-
     } catch (...) {
         Context->LogError(
             "RandomTreasureDrop: could not cache compiled Treasure Classes rows.");
@@ -2283,15 +2460,16 @@ auto LoadConfiguredRules() noexcept -> bool {
         return true;
     }
 
-    const auto roots = DataRoots(Context);
+    const ModInstallLock installLock;
+    ExcelSetup setup(*Context);
     std::vector<TreasureClassInfo> treasureRows;
     std::unordered_map<std::string, std::uint32_t> rowsByName;
-    if (!ParseTreasureClasses(roots, treasureRows, rowsByName, error)) {
+    if (!ParseTreasureClasses(setup, treasureRows, rowsByName, error)) {
         const std::string message = "RandomTreasureDrop: " + error;
         Context->LogError(message.c_str());
         return false;
     }
-    if (!ResolveDropTableSelectors(parsed, roots, treasureRows,
+    if (!ResolveDropTableSelectors(parsed, setup, treasureRows,
             rowsByName, error)) {
         const std::string message = "RandomTreasureDrop: " + error;
         Context->LogError(message.c_str());
@@ -2299,11 +2477,23 @@ auto LoadConfiguredRules() noexcept -> bool {
     }
     std::vector<SourceItem> items;
     std::vector<TypeEquivalence> types;
-    if (!ReadItemSources(roots, items, types, error)
-            || !ResolveRuleItems(parsed, items, types, error)) {
+    if (!ReadItemSources(setup, parsed, items, types, error)) {
         const std::string message = "RandomTreasureDrop: " + error;
         Context->LogError(message.c_str());
         return false;
+    }
+    if (!ResolveRuleItems(parsed, items, types, error)) {
+        const std::string message = "RandomTreasureDrop: " + error
+            + ". Check weapons.txt, armor.txt, and misc.txt" + setup.ItemTableLocations() + ".";
+        Context->LogError(message.c_str());
+        return false;
+    }
+    if (const auto copied = setup.CopyMissing(); copied != 0) {
+        const std::string message = "RandomTreasureDrop: first-run table setup complete; "
+            + std::to_string(copied)
+            + " loose table(s) added. Exit and restart D2RLoader with the same mod to enable bonus drops.";
+        Context->LogInfo(message.c_str());
+        return true;
     }
     {
         const std::lock_guard<std::mutex> lock(StateMutex);
@@ -2312,6 +2502,10 @@ auto LoadConfiguredRules() noexcept -> bool {
         TreasureClassByName = std::move(rowsByName);
     }
     return true;
+    } catch (const std::exception& error) {
+        const std::string message = std::string("RandomTreasureDrop: table setup failed: ") + error.what();
+        Context->LogError(message.c_str());
+        return false;
     } catch (...) {
         if (Context != nullptr) {
             Context->LogError(
@@ -2354,8 +2548,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(
         Context = nullptr;
         return false;
     }
-    Context->LogInfo(
-        "RandomTreasureDrop 0.1.43: selected droptables are not named in the log; successful bonus drops are logged. Zero path coordinates still fall back to the player's location.");
+    Context->LogInfo("RandomTreasureDrop 1.1.43: ready to select bonus drops on game join.");
     return true;
 }
 
@@ -2363,4 +2556,3 @@ D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     Shutdown();
     Context = nullptr;
 }
-
