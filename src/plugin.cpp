@@ -232,7 +232,7 @@ constexpr D2RL::PluginInfo Info{
     .abiVersion = D2RL_PLUGIN_ABI_VERSION,
     .id = PluginId,
     .name = "Random Treasure Drop",
-    .version = "1.1.44",
+    .version = "1.1.45",
     .author = "MadMike",
     .description = "Adds independently rolled bonus drops at selected Treasure Class sources.",
     .flags = D2RL::PluginFlags::Server | D2RL::PluginFlags::NativeHooks,
@@ -2568,7 +2568,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(
         Context = nullptr;
         return false;
     }
-    Context->LogInfo("RandomTreasureDrop 1.1.44: ready to select bonus drops on game join.");
+    Context->LogInfo("RandomTreasureDrop 1.1.45: ready to select bonus drops on game join.");
     return true;
 }
 

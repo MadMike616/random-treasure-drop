@@ -1,5 +1,7 @@
 ## Changes
 
-- Successful first-run file setup now records a completion token in the plugin TOML and is skipped on later launches.
-- Existing installations and user settings are preserved; unsuccessful setup can be retried.
-- Later launches use the installed tables without repeating base-file copies.
+- Clarified first-launch configuration creation. Existing treasure-drop rules and settings are unchanged.
+
+## Compatibility
+
+Windows x64; D2RLoader PluginSDK 0.4.0 / Plugin ABI 4. Existing native layout checks and previously documented testing limits remain applicable. This maintenance build has not been retested in-game.

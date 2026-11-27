@@ -1,5 +1,7 @@
 # Random Treasure Drop
 
+Current release: 1.1.45. Clarified first-launch configuration creation. Existing treasure-drop rules and settings are unchanged.
+
 Random Treasure Drop is a D2RLoader plugin that creates independently rolled bonus items from configured Treasure Class rows. The game's normal drop routine runs unchanged; a successful plugin roll creates one additional item at the source unit's location when available.
 
 ## Install

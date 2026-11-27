@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.29)
 
-project(RandomTreasureDrop VERSION 1.1.44 LANGUAGES CXX RC)
+project(RandomTreasureDrop VERSION 1.1.45 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
