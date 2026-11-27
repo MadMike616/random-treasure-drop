@@ -6,11 +6,11 @@
 |---|---|
 | Plugin name | Random Treasure Drop |
 | Plugin ID | random-treasure-drop |
-| Release version | 1.1.43 |
-| Inventory updated | 2026-11-17 |
-| Source revision | v1.1.43 |
+| Release version | 1.1.44 |
+| Inventory updated | 2026-11-27 |
+| Source revision | v1.1.44 release source |
 | D2R build(s) audited | D2R 3.3.93847; D2R 3.4.95032 (prior runtime validation) |
-| D2RLoader SDK / Plugin ABI | PluginSDK 0.4.0, commit 6eb8f8b6192868214706bd6d528c5294f2f551b7 / Plugin ABI 4 |
+| D2RLoader SDK / Plugin ABI | PluginSDK 0.4.0, commit 03a5af9e0feb3f95f95e148e330e01f6635950df / Plugin ABI 4 |
 | Audit status | Partial |
 
 ## Scope and method
@@ -33,3 +33,7 @@ None identified in the current inventory; this is not a compatibility guarantee.
 ## Audit notes
 
 The expected native signatures and helper RVAs were originally validated against D2R 3.3.93847. D2R 3.4.95032 runtime logs from the prior compatibility update confirmed the hook installed and produced a bonus drop. The v1.1.43 installer has not been tested in game.
+
+The 1.1.44 SDK and installation-token update does not change hook sites or native signatures. Installation checks were exercised in isolated fixtures; in-game validation of this build remains pending.
+
+Release 1.1.44 source review: TOML installation completion and configuration mirroring add no native hook, patch, vtable, or OS input-hook targets. Hook-site changes since the previous release: none. Startup completion was checked in the testing environment; the existing native validation limits above still apply.

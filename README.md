@@ -83,13 +83,13 @@ The plugin runs this calculation separately from the game's native drop calculat
 
 The baseline uses the source row's static `NoDrop` and `Prob1` through `Prob10` values. D2R's runtime `/players` adjustment to `NoDrop` is not included in the bonus-drop calculation.
 
-The bonus item is created at the source unit's ground location when its location data is valid. If that location cannot be read, the plugin tries the responsible player's location. Its quality defaults to Normal unless the selected item entry specifies another quality, and its level comes from the native drop routine, clamped to 1–99.
+The bonus item is created at the source unit's ground location when its location data is valid. If that location cannot be read, the plugin tries the responsible player's location. Its quality defaults to Normal unless the selected item entry specifies another quality, and its level comes from the native drop routine, clamped to 1â€“99.
 
 Logs confirm group selections and successful bonus drops. They never identify the selected Treasure Class row.
 
 ## Compatibility
 
-Verified with D2R builds `3.3.93847` and `3.4.95032`. The plugin requires D2RLoader PluginSDK ABI 4, including its lifecycle and data-table services. It does not gate loading on a specific D2R version; before installing the native drop hook, it checks expected game-code signatures and the Treasure Class table layout, and leaves the hook uninstalled if validation fails.
+Verified with D2R builds `3.3.93847` and `3.4.95032`. The plugin is built with D2RLoader PluginSDK 0.4.0 (Plugin ABI 4) and requires its lifecycle and data-table services. It does not gate loading on a specific D2R version; before installing the native drop hook, it checks expected game-code signatures and the Treasure Class table layout, and leaves the hook uninstalled if validation fails.
 
 ## Build
 
@@ -100,8 +100,31 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-The build fetches a pinned D2RLoader PluginSDK revision. To build offline, configure with `RANDOM_TREASURE_DROP_LOCAL_SDK_DIR` set to a local PluginSDK checkout.
+The build fetches the pinned D2RLoader PluginSDK 0.4.0 revision. To build offline, configure with `RANDOM_TREASURE_DROP_LOCAL_SDK_DIR` set to a local PluginSDK checkout.
 
 ## License
 
 This project is distributed under the MIT License. See [LICENSE](LICENSE).
+
+
+## Installation completion
+
+After the configured tables have been validated and all required copies succeed,
+setup records this token in the existing plugin TOML:
+
+~~~toml
+[installation]
+schema_version = 1
+complete = true
+~~~
+
+Later launches read the installed tables for normal drop behavior but skip base-file
+setup and token writes. Existing loose tables are preserved. Failed or incomplete
+setup leaves the token unset so the next launch can retry. The token is committed
+under the shared mod-install lock, and the corresponding I Hate TOMLs copy is
+updated when that integration is present.
+
+Keep numbered item groups above the `[installation]` section so they remain
+top-level TOML settings. If a completed installation loses a required table, restore
+that file or close the game and set `complete = false` to rerun setup. Do the same
+when new configuration entries need additional base files that have not been installed.

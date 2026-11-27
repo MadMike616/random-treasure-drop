@@ -1,3 +1,4 @@
+#include "install_token.hpp"
 #include <D2RLPlugin/api.h>
 
 #include "default_config.hpp"
@@ -228,18 +229,18 @@ auto NativeDropResultName(NativeDropResult result) noexcept -> const char* {
 
 constexpr D2RL::PluginInfo Info{
     .infoSize = D2RL::PluginInfoSize,
-    .apiVersion = D2RL_PLUGIN_API_VERSION,
+    .abiVersion = D2RL_PLUGIN_ABI_VERSION,
     .id = PluginId,
     .name = "Random Treasure Drop",
-    .version = "1.1.43",
+    .version = "1.1.44",
     .author = "MadMike",
     .description = "Adds independently rolled bonus drops at selected Treasure Class sources.",
     .flags = D2RL::PluginFlags::Server | D2RL::PluginFlags::NativeHooks,
 };
 
 const D2RL::PluginContext* Context{};
-const D2RL::LifecycleServiceV1* LifecycleService{};
-const D2RL::DataTableServiceV1* DataTableService{};
+const D2RL::LifecycleService* LifecycleService{};
+const D2RL::DataTableService* DataTableService{};
 D2RL::Lifecycle::ListenerHandle DataTablesListenerHandle{};
 D2RL::Lifecycle::ListenerHandle GameJoinedListenerHandle{};
 D2RL::Lifecycle::ListenerHandle GameLeftListenerHandle{};
@@ -507,6 +508,8 @@ auto ParseItemSpec(std::string_view text, ItemSpec& item,
 auto ParseConfig(std::string_view text, std::vector<Rule>& parsed,
         std::string& error) -> bool {
     try {
+        const auto withoutToken = InstallToken::WithoutSections(text);
+        text = withoutToken;
         std::map<std::uint32_t, PartialRule> groups;
         std::size_t lineNumber{};
         while (!text.empty()) {
@@ -853,7 +856,8 @@ auto FindModDataRoot(const D2RL::PluginContext& context,
 class ExcelSetup {
 public:
     explicit ExcelSetup(const D2RL::PluginContext& context)
-        : roots_(DataRoots(&context)), dataRoot_(FindModDataRoot(context, roots_)) {
+        : roots_(DataRoots(&context)), dataRoot_(FindModDataRoot(context, roots_)),
+          context_(context), complete_(InstallToken::Complete(context)) {
         if (!dataRoot_.empty()) {
             modRoot_ = SamePathPart(dataRoot_.extension(), L".mpq")
                 ? dataRoot_.parent_path() : dataRoot_;
@@ -877,12 +881,13 @@ public:
     }
 
     auto Base(std::string_view name) const -> fs::path {
-        if (modRoot_.empty()) return {};
+        if (complete_ || modRoot_.empty()) return {};
         const auto source = CheckedChild(modRoot_, BaseExcel / Utf8Path(name));
         return IsLooseFile(source) ? source : fs::path{};
     }
 
     void Queue(std::string_view name, const fs::path& base) {
+        if (complete_) throw std::runtime_error("Completed installation cannot queue new table copies");
         auto target = CheckedChild(dataRoot_, LooseExcel / Utf8Path(name));
         copies_.emplace(std::move(target), base);
     }
@@ -890,6 +895,11 @@ public:
     auto Required(std::string_view name, std::string& error) -> fs::path {
         auto path = Loose(name);
         if (!path.empty()) return path;
+        if (complete_) {
+            error = std::string(name)
+                + " is missing from the completed installation; restore it or reset installation.complete";
+            return {};
+        }
         path = Base(name);
         if (!path.empty()) {
             Queue(name, path);
@@ -911,7 +921,11 @@ public:
 
     // Called only after the inputs and TOML resolve successfully, while holding the shared lock.
     auto CopyMissing() const -> std::size_t {
-        if (copies_.empty()) return 0;
+        if (complete_) return 0;
+        if (copies_.empty()) {
+            InstallToken::Commit(context_);
+            return 0;
+        }
         const auto excel = CheckedChild(dataRoot_, LooseExcel);
         fs::create_directories(excel);
         const auto staging = CheckedChild(dataRoot_, LooseExcel /
@@ -946,6 +960,7 @@ public:
             throw;
         }
         cleanup();
+        InstallToken::Commit(context_);
         return copies_.size();
     }
 
@@ -956,6 +971,8 @@ private:
     fs::path dataRoot_;
     fs::path modRoot_;
     std::map<fs::path, fs::path> copies_;
+    const D2RL::PluginContext& context_;
+    bool complete_{};
 };
 
 auto ReadTsv(const std::filesystem::path& path, TableText& table,
@@ -2347,16 +2364,19 @@ void __cdecl OnGameLeft(
 }
 
 auto LoadServices() noexcept -> bool {
-    if (Context->QueryService(D2RL::ServiceId::Lifecycle,
-            D2RL::LifecycleServiceV1Version, &LifecycleService)
+    if (Context->QueryService(&LifecycleService)
                 != D2RL::ServiceQueryResult::Success
-            || !D2RL::HasLifecycleServiceV1Field(LifecycleService,
-                D2RL::LifecycleServiceV1RequiredSize)
-            || Context->QueryService(D2RL::ServiceId::DataTable,
-                D2RL::DataTableServiceV1Version, &DataTableService)
+            || !D2RL::HasLifecycleServiceField(LifecycleService,
+                D2RL::LifecycleServiceRequiredSize)
+            || Context->QueryService(&DataTableService)
                 != D2RL::ServiceQueryResult::Success
-            || !D2RL::HasDataTableServiceV1Field(DataTableService,
-                D2RL::DataTableServiceV1RequiredSize)) {
+            || !D2RL::HasDataTableServiceField(DataTableService,
+                D2RL::DataTableServiceRequiredSize)
+            || !LifecycleService->registerDataTablesLoadedListener
+            || !LifecycleService->unregisterDataTablesLoadedListener
+            || !LifecycleService->registerGameplayEventListener
+            || !LifecycleService->unregisterGameplayEventListener
+            || !DataTableService->getTable || !DataTableService->findRowByCode) {
         Context->LogError(
             "RandomTreasureDrop: a required lifecycle or data-table service is unavailable.");
         return false;
@@ -2441,6 +2461,7 @@ void Shutdown() noexcept {
 
 auto LoadConfiguredRules() noexcept -> bool {
     try {
+    const ModInstallLock installLock;
     std::string configText;
     if (!ReadConfigText(configText)) {
         Context->LogError(
@@ -2460,7 +2481,6 @@ auto LoadConfiguredRules() noexcept -> bool {
         return true;
     }
 
-    const ModInstallLock installLock;
     ExcelSetup setup(*Context);
     std::vector<TreasureClassInfo> treasureRows;
     std::unordered_map<std::string, std::uint32_t> rowsByName;
@@ -2526,7 +2546,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(
         const D2RL::PluginContext* context) noexcept -> bool {
     Shutdown();
     if (!D2RL::HasContext(context)
-            || context->apiVersion != D2RL_PLUGIN_API_VERSION) {
+            || context->abiVersion != D2RL_PLUGIN_ABI_VERSION) {
         return false;
     }
     Context = context;
@@ -2548,7 +2568,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(
         Context = nullptr;
         return false;
     }
-    Context->LogInfo("RandomTreasureDrop 1.1.43: ready to select bonus drops on game join.");
+    Context->LogInfo("RandomTreasureDrop 1.1.44: ready to select bonus drops on game join.");
     return true;
 }
 

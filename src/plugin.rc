@@ -1,11 +1,11 @@
 #include <D2RLPlugin/resource.h>
 #include <D2RLPlugin/version.h>
 
-D2RL_PLUGIN_MANIFEST_RESOURCE_ID RCDATA { D2RL_PLUGIN_RESOURCE_DWORD(D2RL_PLUGIN_API_VERSION) }
+D2RL_PLUGIN_MANIFEST_RESOURCE_ID RCDATA { D2RL_PLUGIN_RESOURCE_DWORD(D2RL_PLUGIN_ABI_VERSION) }
 
 1 VERSIONINFO
-FILEVERSION 1,1,43,0
-PRODUCTVERSION 1,1,43,0
+FILEVERSION 1,1,44,0
+PRODUCTVERSION 1,1,44,0
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
@@ -13,11 +13,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "MadMike"
       VALUE "FileDescription", "Independent weighted Treasure Class bonus drops."
-      VALUE "FileVersion", "1.1.43"
+      VALUE "FileVersion", "1.1.44"
       VALUE "InternalName", "random-treasure-drop"
       VALUE "OriginalFilename", "d2rl-random-treasure-drop.dll"
       VALUE "ProductName", "Random Treasure Drop"
-      VALUE "ProductVersion", "1.1.43"
+      VALUE "ProductVersion", "1.1.44"
     END
   END
   BLOCK "VarFileInfo"

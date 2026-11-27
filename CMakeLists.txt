@@ -1,13 +1,13 @@
 cmake_minimum_required(VERSION 3.29)
 
-project(RandomTreasureDrop VERSION 1.1.43 LANGUAGES CXX RC)
+project(RandomTreasureDrop VERSION 1.1.44 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(RANDOM_TREASURE_DROP_LOCAL_SDK_DIR "" CACHE PATH
-    "Optional local D2RLoader PluginSDK include tree for offline builds")
+    "Optional local D2RLoader PluginSDK 0.4.0 include tree for offline builds")
 if(RANDOM_TREASURE_DROP_LOCAL_SDK_DIR)
     add_library(D2RLPlugin INTERFACE)
     add_library(D2RLPlugin::D2RLPlugin ALIAS D2RLPlugin)
@@ -20,7 +20,7 @@ else()
     FetchContent_Declare(
         D2RLoaderPluginSDK
         GIT_REPOSITORY https://github.com/D2RLoader/PluginSDK.git
-        GIT_TAG 6eb8f8b6192868214706bd6d528c5294f2f551b7
+        GIT_TAG 03a5af9e0feb3f95f95e148e330e01f6635950df
         GIT_PROGRESS TRUE
     )
     FetchContent_MakeAvailable(D2RLoaderPluginSDK)
